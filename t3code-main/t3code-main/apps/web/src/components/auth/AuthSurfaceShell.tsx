@@ -5,7 +5,7 @@ import { resolveSidebarStageBackdropVariant, StageBackdropArt } from "../Sidebar
 import { StandalonePage } from "../ui/standalone-page";
 
 export function AuthSurfaceShell({ children }: { readonly children: ReactNode }) {
-  const stageVariant = resolveSidebarStageBackdropVariant(APP_STAGE_LABEL);
+  const stageVariant = resolveSidebarStageBackdropVariant(APP_STAGE_LABEL ?? "");
 
   return (
     <StandalonePage

@@ -6,6 +6,7 @@ import { Link, useLocation, useNavigate } from "@tanstack/react-router";
 import { useEnvironmentIdentificationMode } from "../../hooks/useSettings";
 import { cn } from "../../lib/utils";
 import { usePullRequestsSupported } from "../../state/environments";
+import { HarvyWordmark } from "../HarvyWordmark";
 import {
   resolveEnvironmentIdentificationPillLabel,
   resolveSidebarStageBackdropVariant,
@@ -70,6 +71,17 @@ export const SidebarChromeHeader = memo(function SidebarChromeHeader({
             </Badge>
           </div>
         ) : null}
+        <Link
+          to="/goagent"
+          className={cn(
+            "ml-auto hidden h-6 shrink-0 items-center gap-1.5 rounded-full px-3 text-xs font-semibold tracking-wide transition-all hover:scale-[1.03] hover:opacity-90 focus-visible:ring-2 focus-visible:ring-ring outline-hidden md:flex",
+            backdropVariant ? "bg-white/20 text-white" : "bg-primary text-primary-foreground",
+          )}
+          aria-label="Open Harvy"
+        >
+          <WorkflowIcon className="size-3 shrink-0" />
+          Open Harvy
+        </Link>
       </div>
     </div>
   );
@@ -118,10 +130,11 @@ function SidebarBrandMark({ onBackdrop }: { onBackdrop: boolean }) {
   return (
     <span
       className={cn(
-        "inline-flex min-w-0 items-baseline text-sm font-semibold tracking-tight [text-box:trim-both_cap_alphabetic] supports-[text-box:trim-both_cap_alphabetic]:py-1",
+        "inline-flex min-w-0 items-center gap-1.5 text-sm font-semibold tracking-tight",
         onBackdrop ? "text-white" : "text-foreground",
       )}
     >
+      <HarvyWordmark className="h-[0.9em] w-auto shrink-0" aria-hidden />
       Harvy
     </span>
   );
@@ -219,7 +232,7 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
           ) : null}
           <SidebarUtilityItem
             icon={<WorkflowIcon />}
-            label="GoAgent"
+            label="Harvy"
             onClick={handleGoAgentClick}
           />
           <SidebarUtilityItem

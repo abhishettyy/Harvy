@@ -361,7 +361,7 @@ function DocumentTitleSync() {
   const title = resolveServerBackedAppDisplayName({
     baseName: APP_BASE_NAME,
     fallbackDisplayName: APP_DISPLAY_NAME,
-    fallbackStageLabel: APP_STAGE_LABEL,
+    fallbackStageLabel: APP_STAGE_LABEL ?? "",
     primaryServerVersion,
   });
 

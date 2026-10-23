@@ -36,7 +36,7 @@ export function useEnvironmentStageLabel(): string {
 
   return resolveServerBackedAppStageLabel({
     primaryServerVersion,
-    fallbackStageLabel: APP_STAGE_LABEL,
+    fallbackStageLabel: APP_STAGE_LABEL ?? "",
   });
 }
 

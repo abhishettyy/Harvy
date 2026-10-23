@@ -1532,8 +1532,8 @@ function OpenCommandPaletteDialog(props: {
   actionItems.push({
     kind: "action",
     value: "action:goagent",
-    searchTerms: ["goagent", "mission", "parallel agents", "knowledge graph", "graphify", "jev"],
-    title: "Open GoAgent",
+    searchTerms: ["harvy", "goagent", "mission", "parallel agents", "knowledge graph", "graphify", "jev"],
+    title: "Open Harvy",
     icon: <WorkflowIcon className={ITEM_ICON_CLASS} />,
     run: async () => {
       await navigate({ to: "/goagent" });
