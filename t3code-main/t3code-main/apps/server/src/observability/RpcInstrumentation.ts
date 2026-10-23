@@ -226,6 +226,8 @@ const RPC_AGGREGATES = {
   [WS_METHODS.goagentOverrideDecision]: "goagent",
   [WS_METHODS.goagentIntegrateMission]: "goagent",
   [WS_METHODS.goagentVerifyMission]: "goagent",
+  [WS_METHODS.goagentRequestRepair]: "goagent",
+  [WS_METHODS.goagentUpdateProjectDecisions]: "goagent",
   [WS_METHODS.goagentSubscribeMission]: "goagent",
 } as const satisfies Readonly<Record<WsRpcMethod, string>>;
 

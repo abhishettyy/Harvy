@@ -3,6 +3,7 @@ import {
   GoAgentContractSpec,
   GoAgentGraphEdge,
   GoAgentGraphNode,
+  GoAgentProjectDecision,
   GoAgentTaskState,
   OrchestratorMcpFailure,
 } from "@t3tools/contracts";
@@ -132,6 +133,60 @@ const TaskStatusTool = Tool.make("goagent_task_status", {
   .annotate(Tool.Idempotent, true)
   .annotate(Tool.OpenWorld, false);
 
+const ProjectDecisionsTool = Tool.make("goagent_project_decisions", {
+  description:
+    "Only for agents working on a GoAgent mission task. List the project decisions the project's owner recorded (for example which auth service to use). Follow them; `seeded` ones were imported from the repository's DECISIONS.md.",
+  success: Schema.Struct({ decisions: Schema.Array(GoAgentProjectDecision) }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Title, "GoAgent project decisions")
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, false);
+
+const RecordDecisionTool = Tool.make("goagent_record_decision", {
+  description:
+    "Only for agents working on a GoAgent mission task. Record one significant design decision you made: what you chose and why, one line each. The user sees each agent's decisions side by side. Do not record routine steps.",
+  parameters: Schema.Struct({
+    decision: Schema.String.check(Schema.isMinLength(3)),
+    reason: Schema.String.check(Schema.isMinLength(3)),
+  }),
+  success: Schema.Struct({ recorded: Schema.Int }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Title, "Record a GoAgent design decision")
+  .annotate(Tool.Readonly, false)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, false)
+  .annotate(Tool.OpenWorld, false);
+
+const HandoffTool = Tool.make("goagent_handoff", {
+  description:
+    "Only for agents working on a GoAgent mission task. Hand a short note to whichever other mission agent needs it (you changed something they rely on, or you need something from them). Name the files involved. GoAgent's decision model picks the receiving agent from the knowledge graph and file ownership, or decides nobody needs it; the result says who received it. Use sparingly: the mission has a small handoff budget.",
+  parameters: Schema.Struct({
+    note: Schema.String.check(Schema.isMinLength(3)),
+    files: Schema.optional(Schema.Array(Schema.String)),
+  }),
+  success: Schema.Struct({
+    routedTo: Schema.NullOr(Schema.String),
+    source: Schema.String,
+    confidence: Schema.NullOr(Schema.Number),
+  }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Title, "Hand work to another GoAgent agent")
+  .annotate(Tool.Readonly, false)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, false)
+  .annotate(Tool.OpenWorld, false);
+
 export const GoAgentToolkit = Toolkit.make(
   GraphSearchTool,
   GraphNeighboursTool,
@@ -139,4 +194,7 @@ export const GoAgentToolkit = Toolkit.make(
   ContractReadTool,
   ContractAcknowledgeTool,
   TaskStatusTool,
+  ProjectDecisionsTool,
+  RecordDecisionTool,
+  HandoffTool,
 );

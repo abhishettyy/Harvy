@@ -73,14 +73,20 @@ export function createGoAgentAtoms<R, E>(
     updatePlan: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:goagent:update-plan",
       tag: WS_METHODS.goagentUpdatePlan,
+      onSuccess: ({ environmentId }, registry, result) =>
+        refreshProject(registry, environmentId, result.mission.projectId),
     }),
     approveMission: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:goagent:approve-mission",
       tag: WS_METHODS.goagentApproveMission,
+      onSuccess: ({ environmentId }, registry, result) =>
+        refreshProject(registry, environmentId, result.mission.projectId),
     }),
     startMission: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:goagent:start-mission",
       tag: WS_METHODS.goagentStartMission,
+      onSuccess: ({ environmentId }, registry, result) =>
+        refreshProject(registry, environmentId, result.mission.projectId),
       concurrency: {
         mode: "singleFlight",
         key: ({ environmentId, input }) => `${environmentId}:${input.missionId}`,
@@ -89,6 +95,8 @@ export function createGoAgentAtoms<R, E>(
     cancelMission: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:goagent:cancel-mission",
       tag: WS_METHODS.goagentCancelMission,
+      onSuccess: ({ environmentId }, registry, result) =>
+        refreshProject(registry, environmentId, result.mission.projectId),
     }),
     overrideDecision: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:goagent:override-decision",
@@ -97,6 +105,8 @@ export function createGoAgentAtoms<R, E>(
     integrateMission: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:goagent:integrate-mission",
       tag: WS_METHODS.goagentIntegrateMission,
+      onSuccess: ({ environmentId }, registry, result) =>
+        refreshProject(registry, environmentId, result.mission.projectId),
       concurrency: {
         mode: "singleFlight",
         key: ({ environmentId, input }) => `${environmentId}:${input.missionId}`,
@@ -105,6 +115,25 @@ export function createGoAgentAtoms<R, E>(
     verifyMission: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:goagent:verify-mission",
       tag: WS_METHODS.goagentVerifyMission,
+      onSuccess: ({ environmentId }, registry, result) =>
+        refreshProject(registry, environmentId, result.mission.projectId),
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId, input }) => `${environmentId}:${input.missionId}`,
+      },
+    }),
+    updateProjectDecisions: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:goagent:update-project-decisions",
+      tag: WS_METHODS.goagentUpdateProjectDecisions,
+      // Decisions also appear as graph nodes.
+      onSuccess: ({ environmentId, input }, registry) =>
+        refreshProject(registry, environmentId, input.projectId),
+    }),
+    requestRepair: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:goagent:request-repair",
+      tag: WS_METHODS.goagentRequestRepair,
+      onSuccess: ({ environmentId }, registry, result) =>
+        refreshProject(registry, environmentId, result.mission.projectId),
       concurrency: {
         mode: "singleFlight",
         key: ({ environmentId, input }) => `${environmentId}:${input.missionId}`,

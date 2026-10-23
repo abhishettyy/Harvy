@@ -63,6 +63,19 @@ const handlers = {
       ),
     ),
   ),
+  goagent_project_decisions: McpToolAccess.readsAsCaller(() =>
+    withCaller((service, caller) =>
+      service.agentProjectDecisions(caller).pipe(Effect.map((decisions) => ({ decisions }))),
+    ),
+  ),
+  goagent_record_decision: McpToolAccess.actsAsCaller((input) =>
+    withCaller((service, caller) => service.agentRecordDecision(caller, input)),
+  ),
+  goagent_handoff: McpToolAccess.actsAsCaller((input) =>
+    withCaller((service, caller) =>
+      service.agentHandoff(caller, { note: input.note, files: input.files ?? [] }),
+    ),
+  ),
 } satisfies McpToolAccess.Handlers<typeof GoAgentToolkit.tools>;
 
 export const layer = McpToolAccess.toLayer(GoAgentToolkit, handlers);

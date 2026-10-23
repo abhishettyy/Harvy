@@ -61,6 +61,8 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
   [WS_METHODS.goagentOverrideDecision]: AuthOrchestrationOperateScope,
   [WS_METHODS.goagentIntegrateMission]: AuthOrchestrationOperateScope,
   [WS_METHODS.goagentVerifyMission]: AuthOrchestrationOperateScope,
+  [WS_METHODS.goagentRequestRepair]: AuthOrchestrationOperateScope,
+  [WS_METHODS.goagentUpdateProjectDecisions]: AuthOrchestrationOperateScope,
 } as const;
 export type ClientGuardedRpcTag = keyof typeof CLIENT_GUARDED_RPC_SCOPES;
 

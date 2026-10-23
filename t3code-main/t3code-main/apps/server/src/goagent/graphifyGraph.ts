@@ -6,7 +6,7 @@ import type {
 } from "@t3tools/contracts";
 
 /** `graph.json` schema versions this parser understands. */
-const SUPPORTED_GRAPHIFY_SCHEMA_VERSIONS: ReadonlyArray<number> = [1];
+const SUPPORTED_GRAPHIFY_SCHEMA_VERSIONS: ReadonlySet<number> = new Set([1]);
 
 export interface ParsedGraph {
   readonly graphifyVersion: string | null;
@@ -68,7 +68,7 @@ export function parseGraphifyGraph(raw: unknown): ParseGraphResult {
   const schemaVersion = meta["schema_version"];
   if (typeof schemaVersion !== "number")
     return { ok: false, reason: "malformed", detail: "graph.schema_version is missing" };
-  if (!SUPPORTED_GRAPHIFY_SCHEMA_VERSIONS.includes(schemaVersion))
+  if (!SUPPORTED_GRAPHIFY_SCHEMA_VERSIONS.has(schemaVersion))
     return {
       ok: false,
       reason: "unsupported_schema",

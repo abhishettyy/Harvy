@@ -18,6 +18,10 @@ export type GoAgentDecisionId = typeof GoAgentDecisionId.Type;
 export const GoAgentContractId = TrimmedNonEmptyString.pipe(Schema.brand("GoAgentContractId"));
 export type GoAgentContractId = typeof GoAgentContractId.Type;
 export const GoAgentEventId = TrimmedNonEmptyString.pipe(Schema.brand("GoAgentEventId"));
+export const GoAgentProjectDecisionId = TrimmedNonEmptyString.pipe(
+  Schema.brand("GoAgentProjectDecisionId"),
+);
+export type GoAgentProjectDecisionId = typeof GoAgentProjectDecisionId.Type;
 export type GoAgentEventId = typeof GoAgentEventId.Type;
 export const GoAgentVerificationRunId = TrimmedNonEmptyString.pipe(
   Schema.brand("GoAgentVerificationRunId"),
@@ -42,7 +46,14 @@ export const GoAgentEvidence = Schema.Literals([
 ]);
 export type GoAgentEvidence = typeof GoAgentEvidence.Type;
 
-export const GoAgentGraphNodeKind = Schema.Literals(["file", "symbol", "rationale", "concept"]);
+/** `decision` nodes are project decisions the user recorded, not read from source by Graphify. */
+export const GoAgentGraphNodeKind = Schema.Literals([
+  "file",
+  "symbol",
+  "rationale",
+  "concept",
+  "decision",
+]);
 export type GoAgentGraphNodeKind = typeof GoAgentGraphNodeKind.Type;
 
 export const GoAgentGraphNode = Schema.Struct({
@@ -113,6 +124,9 @@ export const GoAgentDecisionKey = Schema.Literals([
   "mission.risk",
   "contract.match",
   "failure.owner",
+  // Coordination micro-decisions taken while agents run (switching work between agents).
+  "handoff.notify",
+  "handoff.route",
 ]);
 export type GoAgentDecisionKey = typeof GoAgentDecisionKey.Type;
 
@@ -132,6 +146,10 @@ export const GoAgentDecision = Schema.Struct({
   source: GoAgentDecisionSource,
   fallbackReason: Schema.NullOr(Schema.String),
   createdAt: IsoDateTime,
+  /** The agent the decision is about (for handoffs: the agent whose work triggered it). */
+  taskKey: Schema.optionalKey(GoAgentTaskKey),
+  /** For handoffs: the agent the work was switched to, when one was chosen. */
+  targetTaskKey: Schema.optionalKey(GoAgentTaskKey),
 });
 export type GoAgentDecision = typeof GoAgentDecision.Type;
 
@@ -161,12 +179,26 @@ export const GoAgentPlanTask = Schema.Struct({
 });
 export type GoAgentPlanTask = typeof GoAgentPlanTask.Type;
 
+/**
+ * How strongly two tasks' code is linked in the knowledge graph: Graphify edges (imports, calls)
+ * between files one task owns and files the other owns. Drives who is told about whose changes.
+ */
+export const GoAgentTaskCoupling = Schema.Struct({
+  from: GoAgentTaskKey,
+  to: GoAgentTaskKey,
+  edgeCount: NonNegativeInt,
+  /** A few `file -> file (relation)` links, read from the graph, as evidence. */
+  examples: Schema.Array(Schema.String),
+});
+export type GoAgentTaskCoupling = typeof GoAgentTaskCoupling.Type;
+
 export const GoAgentPlan = Schema.Struct({
   title: TrimmedNonEmptyString,
   constraints: Schema.Array(Schema.String),
   contract: Schema.NullOr(GoAgentContractSpec),
   tasks: Schema.Array(GoAgentPlanTask),
   verificationCommandIds: Schema.Array(TrimmedNonEmptyString),
+  coupling: Schema.optionalKey(Schema.Array(GoAgentTaskCoupling)),
 });
 export type GoAgentPlan = typeof GoAgentPlan.Type;
 
@@ -318,6 +350,7 @@ export const GoAgentEventType = Schema.Literals([
   "plan.proposed",
   "plan.updated",
   "plan.approved",
+  "plan.review_required",
   "mission.started",
   "task.started",
   "task.blocked",
@@ -329,12 +362,16 @@ export const GoAgentEventType = Schema.Literals([
   "contract.acknowledged",
   "graph.indexed",
   "graph.delta",
+  "graph.queried",
+  "agent.decision",
+  "handoff.sent",
   "integration.started",
   "integration.conflict",
   "integration.completed",
   "integration.failed",
   "verification.started",
   "verification.finished",
+  "repair.requested",
   "mission.completed",
   "mission.failed",
   "mission.cancelled",
@@ -363,6 +400,11 @@ export const GoAgentMissionSnapshot = Schema.Struct({
   decisions: Schema.Array(GoAgentDecision),
   verificationRuns: Schema.Array(GoAgentVerificationRun),
   events: Schema.Array(GoAgentEvent),
+  /**
+   * True while GoAgent is still reacting to a finished agent (graph re-index, handoff decisions).
+   * Integration waits for it so no agent is switched back on after its work was merged.
+   */
+  coordinating: Schema.optionalKey(Schema.Boolean),
 });
 export type GoAgentMissionSnapshot = typeof GoAgentMissionSnapshot.Type;
 
@@ -382,6 +424,20 @@ export const GoAgentToolStatus = Schema.Struct({
 });
 export type GoAgentToolStatus = typeof GoAgentToolStatus.Type;
 
+/**
+ * A rule the user wants every mission agent to follow ("use the existing JWT auth"). `seeded`
+ * decisions were imported from a file in the repository and say which one.
+ */
+export const GoAgentProjectDecision = Schema.Struct({
+  decisionId: GoAgentProjectDecisionId,
+  projectId: ProjectId,
+  text: TrimmedNonEmptyString,
+  author: Schema.Literals(["user", "seeded"]),
+  sourceFile: Schema.NullOr(Schema.String),
+  createdAt: IsoDateTime,
+});
+export type GoAgentProjectDecision = typeof GoAgentProjectDecision.Type;
+
 export const GoAgentProjectState = Schema.Struct({
   projectId: ProjectId,
   graphify: GoAgentToolStatus,
@@ -390,6 +446,9 @@ export const GoAgentProjectState = Schema.Struct({
   verificationCommands: Schema.Array(GoAgentVerificationCommand),
   suggestedVerificationCommands: Schema.Array(GoAgentVerificationCommand),
   missions: Schema.Array(GoAgentMissionSummary),
+  projectDecisions: Schema.Array(GoAgentProjectDecision),
+  /** A DECISIONS.md at the project root that can be imported as seeded decisions. */
+  decisionsFile: Schema.NullOr(Schema.String),
 });
 export type GoAgentProjectState = typeof GoAgentProjectState.Type;
 
@@ -448,6 +507,27 @@ export const GoAgentVerifyMissionInput = Schema.Struct({
   commandId: Schema.optional(TrimmedNonEmptyString),
 });
 export type GoAgentVerifyMissionInput = typeof GoAgentVerifyMissionInput.Type;
+
+/** Add one decision, import the project's DECISIONS.md as seeded decisions, or retire one. */
+export const GoAgentProjectDecisionChange = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("add"), text: TrimmedNonEmptyString }),
+  Schema.Struct({ type: Schema.Literal("import") }),
+  Schema.Struct({ type: Schema.Literal("retire"), decisionId: GoAgentProjectDecisionId }),
+]);
+export type GoAgentProjectDecisionChange = typeof GoAgentProjectDecisionChange.Type;
+
+export const GoAgentUpdateProjectDecisionsInput = Schema.Struct({
+  projectId: ProjectId,
+  change: GoAgentProjectDecisionChange,
+});
+export type GoAgentUpdateProjectDecisionsInput = typeof GoAgentUpdateProjectDecisionsInput.Type;
+
+/** Without `taskKey`, the repair goes to the owner chosen by the latest `failure.owner` decision. */
+export const GoAgentRequestRepairInput = Schema.Struct({
+  missionId: GoAgentMissionId,
+  taskKey: Schema.optional(GoAgentTaskKey),
+});
+export type GoAgentRequestRepairInput = typeof GoAgentRequestRepairInput.Type;
 
 export const GoAgentErrorCode = Schema.Literals([
   "project_not_found",

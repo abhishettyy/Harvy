@@ -1,6 +1,7 @@
 import {
   GoAgentEventId,
   GoAgentMissionId,
+  GoAgentProjectDecisionId,
   GoAgentScanId,
   ProjectId,
   ThreadId,
@@ -152,6 +153,42 @@ describe("GoAgentStore", () => {
       assert.deepStrictEqual(
         events.map((e) => e.eventId),
         ["e2"],
+      );
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.effect("lists active project decisions and retires one only in its own project", () =>
+    Effect.gen(function* () {
+      const store = yield* GoAgentStore.GoAgentStore;
+      const decision = (id: string, createdAt: string) => ({
+        decisionId: GoAgentProjectDecisionId.make(id),
+        projectId,
+        text: `Rule ${id}`,
+        author: "user" as const,
+        sourceFile: null,
+        createdAt,
+      });
+      yield* store.putProjectDecision(decision("b", "2026-10-22T10:00:00.000Z"));
+      yield* store.putProjectDecision(decision("a", "2026-10-22T09:00:00.000Z"));
+      const other = ProjectId.make("project-2");
+      assert.isFalse(
+        yield* store.retireProjectDecision({
+          projectId: other,
+          decisionId: GoAgentProjectDecisionId.make("a"),
+          retiredAt: "2026-10-22T11:00:00.000Z",
+        }),
+      );
+      assert.isTrue(
+        yield* store.retireProjectDecision({
+          projectId,
+          decisionId: GoAgentProjectDecisionId.make("a"),
+          retiredAt: "2026-10-22T11:00:00.000Z",
+        }),
+      );
+      const active = yield* store.listProjectDecisions(projectId);
+      assert.deepStrictEqual(
+        active.map((d) => d.decisionId),
+        ["b"],
       );
     }).pipe(Effect.provide(layer)),
   );

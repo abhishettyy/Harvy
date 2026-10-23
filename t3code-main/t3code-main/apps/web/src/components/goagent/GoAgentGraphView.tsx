@@ -8,15 +8,39 @@ import type {
   GoAgentScanId,
   ProjectId,
 } from "@t3tools/contracts";
-import { Background, Controls, MarkerType, ReactFlow } from "@xyflow/react";
+import {
+  Background,
+  BackgroundVariant,
+  Controls,
+  Handle,
+  MarkerType,
+  MiniMap,
+  Panel,
+  Position,
+  ReactFlow,
+  type Edge,
+  type Node,
+  type NodeProps,
+} from "@xyflow/react";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/reactivity";
 import { useState } from "react";
 
 import { goagent } from "../../state/goagent";
 import { Button } from "../ui/button";
+import { Input } from "../ui/input";
 import { Spinner } from "../ui/spinner";
-import { buildFileGraph, type FileGraphEdge, type FileGraphNode } from "./goagentLayout";
+import { Toggle } from "../ui/toggle";
+import {
+  buildFileGraph,
+  focusOf,
+  GRAPH_NODE_WIDTH,
+  matchesQuery,
+  type FileGraphEdge,
+  type FileGraphNode,
+  type GraphArea,
+  type GraphLane,
+} from "./goagentLayout";
 
 const EVIDENCE_LABEL = {
   verified_static: "verified from source",
@@ -24,6 +48,20 @@ const EVIDENCE_LABEL = {
   ambiguous: "ambiguous",
   explicit_human: "authored by a person",
 } as const;
+
+/** One accent per app area; hex so the minimap can use it too. */
+const AREA_COLOR: Record<GraphArea, string> = {
+  decision: "#f59e0b",
+  server: "#8b5cf6",
+  tests: "#14b8a6",
+  client: "#0ea5e9",
+  other: "#71717a",
+};
+
+type Selection =
+  | { readonly type: "node"; readonly node: FileGraphNode }
+  | { readonly type: "edge"; readonly edge: FileGraphEdge }
+  | null;
 
 export function GoAgentGraphView({
   environmentId,
@@ -55,7 +93,8 @@ export function GoAgentGraphView({
   return (
     <div className="flex h-full flex-col">
       {views.length > 1 ? (
-        <div className="flex shrink-0 gap-1 border-b px-4 py-2">
+        <div className="flex shrink-0 items-center gap-1 border-b px-4 py-2">
+          <span className="mr-2 text-xs text-muted-foreground">Graph after:</span>
           {views.map((candidate) => (
             <Button
               key={candidate.key}
@@ -66,6 +105,11 @@ export function GoAgentGraphView({
               {candidate.label}
             </Button>
           ))}
+          {showDelta ? (
+            <span className="ml-auto text-xs text-muted-foreground">
+              Green = added by this step · red = removed
+            </span>
+          ) : null}
         </div>
       ) : null}
       <GraphCanvas
@@ -97,12 +141,6 @@ function GraphCanvas({
     }),
   );
   const graph = Option.getOrNull(AsyncResult.value(graphResult));
-  const [showConcepts, setShowConcepts] = useState(false);
-  const [selected, setSelected] = useState<
-    | { readonly type: "node"; readonly node: FileGraphNode }
-    | { readonly type: "edge"; readonly edge: FileGraphEdge }
-    | null
-  >(null);
 
   if (graph === null)
     return (
@@ -121,52 +159,27 @@ function GraphCanvas({
       </div>
     );
 
-  return (
-    <div className="flex h-full min-h-0">
-      <div className="relative min-w-0 flex-1">
-        {deltaFrom === null || scanId === undefined ? (
-          <FileGraphFlow
-            graph={graph}
-            delta={null}
-            showConcepts={showConcepts}
-            onSelect={setSelected}
-          />
-        ) : (
-          <DeltaGraph
-            environmentId={environmentId}
-            graph={graph}
-            baseScanId={deltaFrom}
-            scanId={scanId}
-            showConcepts={showConcepts}
-            onSelect={setSelected}
-          />
-        )}
-        <div className="absolute top-3 left-3 flex flex-col gap-1 rounded-md border bg-background/90 p-2 text-xs">
-          <span>
-            {graph.scan.nodeCount} nodes · {graph.scan.edgeCount} edges · Graphify{" "}
-            {graph.scan.graphifyVersion ?? "?"}
-            {graph.truncated ? " · trimmed for display" : ""}
-          </span>
-          <span className="flex items-center gap-2">
-            <span className="inline-block h-0.5 w-6 bg-foreground" /> verified from source
-          </span>
-          <span className="flex items-center gap-2">
-            <span className="inline-block h-0 w-6 border-t-2 border-dashed border-warning" />{" "}
-            inferred / ambiguous
-          </span>
-          <label className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              checked={showConcepts}
-              onChange={(e) => setShowConcepts(e.target.checked)}
-            />
-            show packages
-          </label>
-        </div>
-      </div>
-      <GraphInspector selected={selected} />
-    </div>
+  return deltaFrom === null || scanId === undefined ? (
+    <GraphExplorer graph={graph} delta={null} />
+  ) : (
+    <DeltaGraph
+      environmentId={environmentId}
+      graph={graph}
+      baseScanId={deltaFrom}
+      scanId={scanId}
+    />
   );
+}
+
+interface GraphData {
+  readonly scan: {
+    readonly nodeCount: number;
+    readonly edgeCount: number;
+    readonly graphifyVersion: string | null;
+  };
+  readonly truncated: boolean;
+  readonly nodes: Parameters<typeof buildFileGraph>[0];
+  readonly edges: Parameters<typeof buildFileGraph>[1];
 }
 
 function DeltaGraph({
@@ -174,113 +187,362 @@ function DeltaGraph({
   graph,
   baseScanId,
   scanId,
-  showConcepts,
-  onSelect,
 }: {
   readonly environmentId: EnvironmentId;
-  readonly graph: NonNullable<Parameters<typeof FileGraphFlow>[0]["graph"]>;
+  readonly graph: GraphData;
   readonly baseScanId: GoAgentScanId;
   readonly scanId: GoAgentScanId;
-  readonly showConcepts: boolean;
-  readonly onSelect: Parameters<typeof FileGraphFlow>[0]["onSelect"];
 }) {
   const deltaResult = useAtomValue(
     goagent.graphDelta({ environmentId, input: { baseScanId, scanId } }),
   );
-  const delta = Option.getOrNull(AsyncResult.value(deltaResult));
-  return (
-    <FileGraphFlow graph={graph} delta={delta} showConcepts={showConcepts} onSelect={onSelect} />
-  );
+  return <GraphExplorer graph={graph} delta={Option.getOrNull(AsyncResult.value(deltaResult))} />;
 }
 
-function FileGraphFlow({
+type FileNodeData = {
+  readonly node: FileGraphNode;
+  readonly dimmed: boolean;
+  readonly highlighted: boolean;
+  readonly selected: boolean;
+};
+type LaneNodeData = { readonly lane: GraphLane };
+type FlowNode = Node<FileNodeData, "file"> | Node<LaneNodeData, "lane">;
+
+const nodeTypes = { file: FileNodeCard, lane: LaneBackdrop };
+
+function GraphExplorer({
   graph,
   delta,
-  showConcepts,
-  onSelect,
 }: {
-  readonly graph: {
-    readonly nodes: Parameters<typeof buildFileGraph>[0];
-    readonly edges: Parameters<typeof buildFileGraph>[1];
-  };
+  readonly graph: GraphData;
   readonly delta: GoAgentGraphDelta | null;
-  readonly showConcepts: boolean;
-  readonly onSelect: (
-    selection:
-      | { readonly type: "node"; readonly node: FileGraphNode }
-      | { readonly type: "edge"; readonly edge: FileGraphEdge }
-      | null,
-  ) => void;
 }) {
+  const [showConcepts, setShowConcepts] = useState(false);
+  const [showEdgeLabels, setShowEdgeLabels] = useState(false);
+  const [query, setQuery] = useState("");
+  const [hiddenRelations, setHiddenRelations] = useState<ReadonlySet<string>>(new Set());
+  const [selected, setSelected] = useState<Selection>(null);
+
   const fileGraph = buildFileGraph(graph.nodes, graph.edges, { delta, showConcepts });
-  const nodes = fileGraph.nodes.map((node) => ({
-    id: node.id,
-    position: { x: node.x, y: node.y },
-    data: {
-      label: (
-        <div className="flex flex-col gap-0.5 text-left">
-          <span className="truncate text-xs font-medium">{node.label}</span>
-          <span className="truncate text-3xs text-muted-foreground">
-            {node.kind === "file" ? `${node.symbols.length} symbols` : node.kind}
-            {node.changed === null ? "" : ` · ${node.changed}`}
-          </span>
-        </div>
-      ),
-    },
-    className: [
-      "rounded-md! border! bg-card! text-card-foreground! w-56!",
-      node.changed === "added" ? "border-success! ring-2 ring-success/40" : "",
-      node.changed === "removed" ? "border-destructive! opacity-60" : "",
-      node.kind === "rationale" ? "border-info!" : "",
-    ].join(" "),
-  }));
-  const edges = fileGraph.edges.map((edge) => {
+  const relations = [...new Set(fileGraph.edges.map((edge) => edge.relation))].toSorted();
+  const shownEdges = fileGraph.edges.filter((edge) => !hiddenRelations.has(edge.relation));
+  const focus =
+    selected?.type === "node"
+      ? focusOf(shownEdges, selected.node.id)
+      : selected?.type === "edge"
+        ? {
+            nodeIds: new Set([selected.edge.source, selected.edge.target]),
+            edgeIds: new Set([selected.edge.id]),
+          }
+        : null;
+  const searching = query.trim().length > 0;
+  const matches = searching
+    ? new Set(fileGraph.nodes.filter((n) => matchesQuery(n, query)).map((n) => n.id))
+    : null;
+
+  const nodes: Array<FlowNode> = [
+    ...fileGraph.lanes.map((lane): FlowNode => ({
+      id: `lane:${lane.area}`,
+      type: "lane",
+      position: { x: lane.x, y: lane.y },
+      data: { lane },
+      style: { width: lane.width, height: lane.height },
+      draggable: false,
+      selectable: false,
+      focusable: false,
+      zIndex: -1,
+    })),
+    ...fileGraph.nodes.map((node): FlowNode => ({
+      id: node.id,
+      type: "file",
+      position: { x: node.x, y: node.y },
+      data: {
+        node,
+        selected: selected?.type === "node" && selected.node.id === node.id,
+        highlighted: matches?.has(node.id) === true,
+        dimmed:
+          (focus !== null && !focus.nodeIds.has(node.id)) ||
+          (matches !== null && !matches.has(node.id)),
+      },
+    })),
+  ];
+
+  const edges: Array<Edge> = shownEdges.map((edge) => {
     const unverified = edge.evidence !== "verified_static" && edge.evidence !== "explicit_human";
+    const inFocus = focus?.edgeIds.has(edge.id) === true;
+    const dimmed = (focus !== null && !inFocus) || matches !== null;
+    const color =
+      edge.changed === "added"
+        ? "var(--color-success)"
+        : edge.changed === "removed"
+          ? "var(--color-destructive)"
+          : edge.evidence === "explicit_human"
+            ? AREA_COLOR.decision
+            : unverified
+              ? "var(--color-warning)"
+              : inFocus
+                ? "var(--color-foreground)"
+                : "var(--color-muted-foreground)";
     return {
       id: edge.id,
       source: edge.source,
       target: edge.target,
-      label: edge.count > 1 ? `${edge.relation} ×${edge.count}` : edge.relation,
-      markerEnd: { type: MarkerType.ArrowClosed },
+      label:
+        showEdgeLabels || inFocus
+          ? edge.count > 1
+            ? `${edge.relation} ×${edge.count}`
+            : edge.relation
+          : undefined,
+      labelStyle: { fontSize: 11, fill: "var(--color-foreground)" },
+      labelBgStyle: { fill: "var(--color-background)" },
+      labelBgPadding: [4, 2] as [number, number],
+      markerEnd: { type: MarkerType.ArrowClosed, color, width: 16, height: 16 },
+      animated: edge.changed === "added",
+      zIndex: inFocus ? 10 : 0,
       style: {
-        strokeDasharray: unverified ? "6 4" : undefined,
-        stroke:
-          edge.changed === "added"
-            ? "var(--color-success)"
-            : edge.changed === "removed"
-              ? "var(--color-destructive)"
-              : unverified
-                ? "var(--color-warning)"
-                : undefined,
-        strokeWidth: edge.changed === null ? 1 : 2,
+        stroke: color,
+        strokeWidth: inFocus || edge.changed !== null ? 2.5 : 1.25,
+        strokeDasharray: unverified
+          ? "6 4"
+          : edge.evidence === "explicit_human"
+            ? "2 4"
+            : undefined,
+        opacity: dimmed ? 0.12 : 1,
       },
     };
   });
+
   const nodeById = new Map(fileGraph.nodes.map((n) => [n.id, n]));
   const edgeById = new Map(fileGraph.edges.map((e) => [e.id, e]));
+  const added = fileGraph.nodes.filter((n) => n.changed === "added").length;
+
   return (
-    <ReactFlow
-      nodes={nodes}
-      edges={edges}
-      fitView
-      minZoom={0.1}
-      nodesDraggable
-      nodesConnectable={false}
-      edgesFocusable
-      onNodeClick={(_, node) => {
-        const found = nodeById.get(node.id);
-        onSelect(found === undefined ? null : { type: "node", node: found });
+    <div className="flex h-full min-h-0">
+      <div className="relative min-w-0 flex-1">
+        <ReactFlow<FlowNode, Edge>
+          nodes={nodes}
+          edges={edges}
+          nodeTypes={nodeTypes}
+          fitView
+          fitViewOptions={{ padding: 0.12 }}
+          minZoom={0.1}
+          maxZoom={2}
+          nodesDraggable
+          nodesConnectable={false}
+          edgesFocusable
+          onNodeClick={(_, node) => {
+            const found = nodeById.get(node.id);
+            setSelected(found === undefined ? null : { type: "node", node: found });
+          }}
+          onEdgeClick={(_, edge) => {
+            const found = edgeById.get(edge.id);
+            setSelected(found === undefined ? null : { type: "edge", edge: found });
+          }}
+          onPaneClick={() => setSelected(null)}
+          proOptions={{ hideAttribution: true }}
+        >
+          <Background variant={BackgroundVariant.Dots} gap={22} size={1} />
+          <Controls showInteractive={false} position="bottom-left" />
+          <MiniMap
+            pannable
+            zoomable
+            position="bottom-right"
+            className="rounded-md! border! bg-card!"
+            maskColor="color-mix(in srgb, var(--color-background) 70%, transparent)"
+            nodeColor={(node) =>
+              node.type === "lane"
+                ? "transparent"
+                : AREA_COLOR[(node.data as FileNodeData).node.area]
+            }
+            nodeStrokeWidth={0}
+          />
+          <Panel position="top-left" className="m-3!">
+            <div className="flex max-w-[44rem] flex-wrap items-center gap-2 rounded-lg border bg-background/95 p-2 shadow-sm backdrop-blur">
+              <Input
+                type="search"
+                size="compact"
+                className="w-56"
+                placeholder="Find a file or function…"
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+              />
+              {searching ? (
+                <span className="text-xs text-muted-foreground">
+                  {matches?.size ?? 0} match{matches?.size === 1 ? "" : "es"}
+                </span>
+              ) : null}
+              <span className="mx-1 h-5 w-px bg-border" />
+              {relations.map((relation) => (
+                <Toggle
+                  key={relation}
+                  size="segmented"
+                  variant="outline"
+                  pressed={!hiddenRelations.has(relation)}
+                  onPressedChange={(pressed) =>
+                    setHiddenRelations((previous) => {
+                      const next = new Set(previous);
+                      if (pressed) next.delete(relation);
+                      else next.add(relation);
+                      return next;
+                    })
+                  }
+                >
+                  {relation}
+                </Toggle>
+              ))}
+              <span className="mx-1 h-5 w-px bg-border" />
+              <Toggle
+                size="segmented"
+                variant="outline"
+                pressed={showEdgeLabels}
+                onPressedChange={setShowEdgeLabels}
+              >
+                Edge labels
+              </Toggle>
+              <Toggle
+                size="segmented"
+                variant="outline"
+                pressed={showConcepts}
+                onPressedChange={setShowConcepts}
+              >
+                Packages
+              </Toggle>
+            </div>
+          </Panel>
+          <Panel position="top-right" className="m-3!">
+            <Legend
+              stats={`${graph.scan.nodeCount} nodes · ${graph.scan.edgeCount} edges${graph.truncated ? " · trimmed" : ""}`}
+              graphify={graph.scan.graphifyVersion}
+              added={delta === null ? null : added}
+            />
+          </Panel>
+        </ReactFlow>
+      </div>
+      <GraphInspector
+        selected={selected}
+        edges={fileGraph.edges}
+        nodeById={nodeById}
+        onSelect={setSelected}
+      />
+    </div>
+  );
+}
+
+function FileNodeCard({ data }: NodeProps<Node<FileNodeData, "file">>) {
+  const { node, dimmed, highlighted, selected } = data;
+  const folder =
+    node.sourceFile === null ? null : node.sourceFile.split("/").slice(0, -1).join("/") || ".";
+  return (
+    <div
+      style={{
+        width: GRAPH_NODE_WIDTH,
+        borderLeftColor: AREA_COLOR[node.area],
+        opacity: dimmed ? 0.25 : 1,
       }}
-      onEdgeClick={(_, edge) => {
-        const found = edgeById.get(edge.id);
-        onSelect(found === undefined ? null : { type: "edge", edge: found });
-      }}
-      onPaneClick={() => onSelect(null)}
-      proOptions={{ hideAttribution: true }}
+      className={[
+        "flex flex-col gap-1 rounded-lg border border-l-4 bg-card px-3 py-2 text-card-foreground shadow-sm transition-opacity",
+        selected ? "ring-2 ring-ring" : "",
+        highlighted ? "ring-2 ring-info" : "",
+        node.changed === "added" ? "border-success! shadow-md shadow-success/30" : "",
+        node.changed === "removed" ? "border-destructive! opacity-60" : "",
+      ].join(" ")}
     >
-      <Background />
-      <Controls showInteractive={false} />
-    </ReactFlow>
+      <Handle type="target" position={Position.Left} className="opacity-0!" />
+      <div className="flex items-center gap-2">
+        <span className="min-w-0 flex-1 truncate text-sm font-semibold">{node.label}</span>
+        {node.changed === null ? null : (
+          <span
+            className={[
+              "shrink-0 rounded px-1.5 text-3xs font-medium uppercase",
+              node.changed === "added"
+                ? "bg-success/15 text-success-foreground"
+                : "bg-destructive/15 text-destructive-foreground",
+            ].join(" ")}
+          >
+            {node.changed}
+          </span>
+        )}
+      </div>
+      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+        <span className="min-w-0 flex-1 truncate">
+          {node.kind === "decision"
+            ? "project decision"
+            : node.kind === "file"
+              ? folder
+              : node.kind}
+        </span>
+        {node.kind === "file" && node.symbols.length > 0 ? (
+          <span className="shrink-0 rounded bg-muted px-1.5 text-3xs">
+            {node.symbols.length} symbol{node.symbols.length === 1 ? "" : "s"}
+          </span>
+        ) : null}
+      </div>
+      <Handle type="source" position={Position.Right} className="opacity-0!" />
+    </div>
+  );
+}
+
+function LaneBackdrop({ data }: NodeProps<Node<LaneNodeData, "lane">>) {
+  const color = AREA_COLOR[data.lane.area];
+  return (
+    <div
+      className="pointer-events-none h-full w-full rounded-xl border"
+      style={{
+        borderColor: `color-mix(in srgb, ${color} 35%, transparent)`,
+        background: `color-mix(in srgb, ${color} 6%, transparent)`,
+      }}
+    >
+      <div className="flex items-center gap-2 px-4 pt-3">
+        <span className="size-2.5 rounded-full" style={{ background: color }} />
+        <span className="text-sm font-semibold">{data.lane.label}</span>
+        <span className="text-xs text-muted-foreground">{data.lane.count}</span>
+      </div>
+    </div>
+  );
+}
+
+function Legend({
+  stats,
+  graphify,
+  added,
+}: {
+  readonly stats: string;
+  readonly graphify: string | null;
+  readonly added: number | null;
+}) {
+  return (
+    <div className="flex w-56 flex-col gap-1.5 rounded-lg border bg-background/95 p-3 text-xs shadow-sm backdrop-blur">
+      <span className="font-medium">{stats}</span>
+      <span className="text-muted-foreground">Built by Graphify {graphify ?? "?"} from source</span>
+      {added === null ? null : (
+        <span className="text-success-foreground">{added} file(s) changed in this step</span>
+      )}
+      <div className="mt-1 grid grid-cols-2 gap-x-2 gap-y-1">
+        {(Object.keys(AREA_COLOR) as Array<GraphArea>).map((area) => (
+          <span key={area} className="flex items-center gap-1.5">
+            <span className="size-2.5 rounded-sm" style={{ background: AREA_COLOR[area] }} />
+            {area}
+          </span>
+        ))}
+      </div>
+      <div className="mt-1 flex flex-col gap-1">
+        <span className="flex items-center gap-2">
+          <span className="inline-block h-0.5 w-6 bg-muted-foreground" /> verified from source
+        </span>
+        <span className="flex items-center gap-2">
+          <span className="inline-block h-0 w-6 border-t-2 border-dashed border-warning" />
+          inferred / ambiguous
+        </span>
+        <span className="flex items-center gap-2">
+          <span
+            className="inline-block h-0 w-6 border-t-2 border-dotted"
+            style={{ borderColor: AREA_COLOR.decision }}
+          />
+          decision governs
+        </span>
+      </div>
+      <span className="mt-1 text-muted-foreground">Click a file to focus on its links.</span>
+    </div>
   );
 }
 
@@ -291,71 +553,137 @@ const cite = (file: string | null, location: string | null) =>
 
 function GraphInspector({
   selected,
+  edges,
+  nodeById,
+  onSelect,
 }: {
-  readonly selected:
-    | { readonly type: "node"; readonly node: FileGraphNode }
-    | { readonly type: "edge"; readonly edge: FileGraphEdge }
-    | null;
+  readonly selected: Selection;
+  readonly edges: ReadonlyArray<FileGraphEdge>;
+  readonly nodeById: ReadonlyMap<string, FileGraphNode>;
+  readonly onSelect: (selection: Selection) => void;
 }) {
-  return (
-    <aside className="flex w-80 shrink-0 flex-col gap-3 overflow-y-auto border-l p-4 text-sm">
-      {selected === null ? (
+  if (selected === null)
+    return (
+      <aside className="flex w-80 shrink-0 flex-col gap-3 overflow-y-auto border-l p-4 text-sm">
+        <span className="font-medium">Inspector</span>
         <p className="text-muted-foreground">
-          Select a node or an edge to see its source evidence.
+          Click a file to see its symbols and what it connects to, or click a link to see the exact
+          source lines it was read from.
         </p>
-      ) : selected.type === "node" ? (
-        <>
-          <div className="flex flex-col gap-1">
-            <span className="font-medium">{selected.node.label}</span>
-            <code className="text-xs text-muted-foreground">
-              {cite(selected.node.sourceFile, selected.node.sourceLocation)}
-            </code>
-            {selected.node.changed === null ? null : (
-              <span className="text-xs">Changed in this view: {selected.node.changed}</span>
-            )}
-          </div>
-          {selected.node.symbols.length > 0 ? (
-            <div className="flex flex-col gap-1">
-              <span className="text-xs font-medium uppercase text-muted-foreground">Symbols</span>
-              {selected.node.symbols.map((symbol) => (
-                <code key={symbol.id} className="text-xs">
-                  {symbol.label}{" "}
-                  <span className="text-muted-foreground">{symbol.sourceLocation}</span>
-                </code>
-              ))}
+      </aside>
+    );
+  if (selected.type === "edge") {
+    const source = nodeById.get(selected.edge.source);
+    const target = nodeById.get(selected.edge.target);
+    return (
+      <aside className="flex w-80 shrink-0 flex-col gap-3 overflow-y-auto border-l p-4 text-sm">
+        <div className="flex flex-col gap-1">
+          <span className="text-xs uppercase text-muted-foreground">Link</span>
+          <span className="font-medium">
+            {source?.label ?? selected.edge.source}{" "}
+            <span className="text-muted-foreground">{selected.edge.relation}</span>{" "}
+            {target?.label ?? selected.edge.target}
+          </span>
+          <span className="text-xs">Evidence: {EVIDENCE_LABEL[selected.edge.evidence]}</span>
+          <span className="text-xs text-muted-foreground">
+            {selected.edge.count} source relationship{selected.edge.count === 1 ? "" : "s"}
+          </span>
+        </div>
+        <div className="flex flex-col gap-2">
+          {selected.edge.examples.map((example) => (
+            <div
+              key={`${example.source}:${example.target}:${example.relation}`}
+              className="flex flex-col rounded-md border p-2"
+            >
+              <code className="text-xs">
+                {example.source} → {example.target}
+              </code>
+              <code className="text-xs text-muted-foreground">
+                {cite(example.sourceFile, example.sourceLocation)} ·{" "}
+                {EVIDENCE_LABEL[example.evidence]}
+                {example.evidence === "verified_static"
+                  ? ""
+                  : ` · score ${example.confidenceScore}`}
+              </code>
             </div>
-          ) : null}
-        </>
+          ))}
+        </div>
+      </aside>
+    );
+  }
+  const node = selected.node;
+  const linkList = (
+    title: string,
+    list: ReadonlyArray<FileGraphEdge>,
+    otherEnd: (edge: FileGraphEdge) => string,
+  ) => (
+    <div className="flex flex-col gap-1">
+      <span className="text-xs font-medium uppercase text-muted-foreground">
+        {title} ({list.length})
+      </span>
+      {list.length === 0 ? (
+        <span className="text-xs text-muted-foreground">None</span>
       ) : (
-        <>
-          <div className="flex flex-col gap-1">
-            <span className="font-medium">{selected.edge.relation}</span>
-            <span className="text-xs">Evidence: {EVIDENCE_LABEL[selected.edge.evidence]}</span>
-            <span className="text-xs text-muted-foreground">
-              {selected.edge.count} source relationship{selected.edge.count === 1 ? "" : "s"}
-            </span>
-          </div>
-          <div className="flex flex-col gap-2">
-            {selected.edge.examples.map((example) => (
-              <div
-                key={`${example.source}:${example.target}:${example.relation}`}
-                className="flex flex-col"
-              >
-                <code className="text-xs">
-                  {example.source} → {example.target}
-                </code>
-                <code className="text-xs text-muted-foreground">
-                  {cite(example.sourceFile, example.sourceLocation)} ·{" "}
-                  {EVIDENCE_LABEL[example.evidence]}
-                  {example.evidence === "verified_static"
-                    ? ""
-                    : ` · score ${example.confidenceScore}`}
-                </code>
-              </div>
-            ))}
-          </div>
-        </>
+        list.map((edge) => {
+          const other = nodeById.get(otherEnd(edge));
+          return (
+            <button
+              key={edge.id}
+              type="button"
+              className="flex items-center gap-2 rounded px-1 py-0.5 text-left text-xs hover:bg-accent"
+              onClick={() => onSelect({ type: "edge", edge })}
+            >
+              <span
+                className="size-2 shrink-0 rounded-full"
+                style={{ background: other === undefined ? undefined : AREA_COLOR[other.area] }}
+              />
+              <span className="min-w-0 flex-1 truncate">{other?.label ?? otherEnd(edge)}</span>
+              <span className="text-muted-foreground">
+                {edge.relation}
+                {edge.count > 1 ? ` ×${edge.count}` : ""}
+              </span>
+            </button>
+          );
+        })
       )}
+    </div>
+  );
+  return (
+    <aside className="flex w-80 shrink-0 flex-col gap-4 overflow-y-auto border-l p-4 text-sm">
+      <div className="flex flex-col gap-1">
+        <span className="flex items-center gap-2">
+          <span className="size-2.5 rounded-sm" style={{ background: AREA_COLOR[node.area] }} />
+          <span className="font-medium">{node.label}</span>
+        </span>
+        <code className="text-xs text-muted-foreground">
+          {cite(node.sourceFile, node.sourceLocation)}
+        </code>
+        {node.changed === null ? null : (
+          <span className="text-xs">Changed in this view: {node.changed}</span>
+        )}
+      </div>
+      {linkList(
+        "Uses",
+        edges.filter((edge) => edge.source === node.id),
+        (edge) => edge.target,
+      )}
+      {linkList(
+        "Used by",
+        edges.filter((edge) => edge.target === node.id),
+        (edge) => edge.source,
+      )}
+      {node.symbols.length > 0 ? (
+        <div className="flex flex-col gap-1">
+          <span className="text-xs font-medium uppercase text-muted-foreground">
+            Symbols ({node.symbols.length})
+          </span>
+          {node.symbols.map((symbol) => (
+            <code key={symbol.id} className="text-xs">
+              {symbol.label} <span className="text-muted-foreground">{symbol.sourceLocation}</span>
+            </code>
+          ))}
+        </div>
+      ) : null}
     </aside>
   );
 }

@@ -53,11 +53,23 @@ const DEFAULT_JEV_MODEL = "jev-latest";
 
 const DecisionInput = Schema.Record(Schema.String, Schema.String);
 
-const fallbackOutcome = (request: DecisionRequest, reason: string): DecisionOutcome => ({
+/**
+ * `jev` keeps what Jev actually said when its answer was rejected for low confidence, so the
+ * decision card can show both Jev's distribution and that the fallback rule chose instead.
+ */
+const fallbackOutcome = (
+  request: DecisionRequest,
+  reason: string,
+  jev?: {
+    readonly probabilities: Readonly<Record<string, number>>;
+    readonly confidence: number | null;
+    readonly model: string;
+  },
+): DecisionOutcome => ({
   answer: request.fallback.answer,
-  probabilities: {},
-  confidence: null,
-  model: null,
+  probabilities: jev?.probabilities ?? {},
+  confidence: jev?.confidence ?? null,
+  model: jev?.model ?? null,
   source: "fallback",
   fallbackReason: `${reason}; ${request.fallback.reason}`,
 });
@@ -105,6 +117,7 @@ export function interpretAnswer(
       return fallbackOutcome(
         request,
         `Jev confidence ${confidence.toFixed(2)} is below ${request.threshold}`,
+        { probabilities: { true: p, false: 1 - p }, confidence, model },
       );
     return {
       answer: label,
@@ -123,6 +136,7 @@ export function interpretAnswer(
       confidence === null
         ? "Jev returned no confidence"
         : `Jev confidence ${confidence.toFixed(2)} is below ${request.threshold}`,
+      { probabilities, confidence, model },
     );
   return {
     answer: answer.label,

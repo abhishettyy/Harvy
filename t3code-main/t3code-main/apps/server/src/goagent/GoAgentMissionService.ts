@@ -6,6 +6,7 @@ import {
   GoAgentError,
   GoAgentEventId,
   GoAgentMissionId,
+  GoAgentProjectDecisionId,
   GoAgentVerificationRunId,
   MessageId,
   ThreadId,
@@ -22,6 +23,8 @@ import {
   type GoAgentMission,
   type GoAgentMissionSnapshot,
   type GoAgentPlan,
+  type GoAgentProjectDecision,
+  type GoAgentProjectDecisionChange,
   type GoAgentProjectState,
   type GoAgentTask,
   type GoAgentVerificationCommand,
@@ -59,17 +62,27 @@ import { neighbourhood } from "./graphifyGraph.ts";
 import {
   contractMatchDecision,
   failureOwnerDecision,
+  handoffNotifyDecision,
+  handoffRouteDecision,
   riskDecision,
   routeDecision,
 } from "./goagentDecisions.ts";
 import {
   buildPlan,
   collapseToSingle,
+  decisionGraph,
+  impactedTasks,
   integrationOrder,
+  ownerOfPath,
+  packageManagerFor,
+  parseDecisionsFile,
   parseTestSummary,
   renderContractUpdateMessage,
+  renderRepairBrief,
   renderGraphContext,
+  renderHandoffMessage,
   renderTaskPrompt,
+  taskCoupling,
   suggestVerificationCommands,
   validatePlan,
 } from "./goagentPlanner.ts";
@@ -79,6 +92,14 @@ const decodeJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unkno
 const OUTPUT_EXCERPT_BYTES = 12_000;
 const CONTEXT_NODE_CAP = 60;
 const CONTEXT_LINE_CAP = 40;
+const MAX_REPAIR_ROUNDS = 1;
+/** GoAgent.md §9.2 budget: past this many Jev calls a mission's decisions use the fallback rules. */
+const MAX_JEV_CALLS_PER_MISSION = 24;
+const MAX_HANDOFFS_PER_MISSION = 8;
+const MAX_AGENT_DECISIONS_PER_TASK = 15;
+const MAX_PROJECT_DECISION_CHARS = 1_000;
+const DECISIONS_FILE = "DECISIONS.md";
+const CONTRACT_REVIEW_PREFIX = "review: contract";
 // GoAgent commits in its own worktrees; a fixed identity keeps that working on machines with no
 // git identity and makes GoAgent-authored commits recognisable.
 const GOAGENT_GIT_IDENTITY = ["-c", "user.name=GoAgent", "-c", "user.email=goagent@localhost"];
@@ -153,13 +174,19 @@ export class GoAgentMissionService extends Context.Service<
       readonly missionId: GoAgentMissionId;
       readonly commandId?: string | undefined;
     }) => Effect.Effect<GoAgentMissionSnapshot, GoAgentError>;
+    readonly updateProjectDecisions: (
+      projectId: ProjectId,
+      change: GoAgentProjectDecisionChange,
+    ) => Effect.Effect<GoAgentProjectState, GoAgentError>;
+    readonly requestRepair: (input: {
+      readonly missionId: GoAgentMissionId;
+      readonly taskKey?: string | undefined;
+    }) => Effect.Effect<GoAgentMissionSnapshot, GoAgentError>;
     readonly subscribeMission: (
       missionId: GoAgentMissionId,
     ) => Stream.Stream<GoAgentMissionSnapshot, GoAgentError>;
 
-    readonly agentTaskStatus: (
-      caller: AgentCaller,
-    ) => Effect.Effect<
+    readonly agentTaskStatus: (caller: AgentCaller) => Effect.Effect<
       {
         readonly mission: GoAgentMission;
         readonly task: GoAgentTask;
@@ -176,6 +203,24 @@ export class GoAgentMissionService extends Context.Service<
       caller: AgentCaller,
       input: { readonly version: number; readonly note: string },
     ) => Effect.Effect<GoAgentContract, GoAgentError>;
+    readonly agentRecordDecision: (
+      caller: AgentCaller,
+      input: { readonly decision: string; readonly reason: string },
+    ) => Effect.Effect<{ readonly recorded: number }, GoAgentError>;
+    readonly agentHandoff: (
+      caller: AgentCaller,
+      input: { readonly note: string; readonly files: ReadonlyArray<string> },
+    ) => Effect.Effect<
+      {
+        readonly routedTo: string | null;
+        readonly source: GoAgentDecision["source"];
+        readonly confidence: number | null;
+      },
+      GoAgentError
+    >;
+    readonly agentProjectDecisions: (
+      caller: AgentCaller,
+    ) => Effect.Effect<ReadonlyArray<GoAgentProjectDecision>, GoAgentError>;
     readonly agentGraphSearch: (
       caller: AgentCaller,
       query: string,
@@ -211,6 +256,22 @@ const make = Effect.gen(function* () {
   const changes = yield* PubSub.unbounded<GoAgentMissionId>();
   // Mission mutations are short and rare; one lock keeps read-modify-write sequences consistent.
   const lock = Semaphore.makeUnsafe(1);
+  // Missions where a finished agent's follow-up (graph delta, handoff decisions) is still running.
+  const coordinating = new Map<GoAgentMissionId, number>();
+  const whileCoordinating = <A, E, R>(
+    missionId: GoAgentMissionId,
+    effect: Effect.Effect<A, E, R>,
+  ) =>
+    Effect.acquireUseRelease(
+      Effect.sync(() => coordinating.set(missionId, (coordinating.get(missionId) ?? 0) + 1)),
+      () => effect,
+      () =>
+        Effect.sync(() => {
+          const left = (coordinating.get(missionId) ?? 1) - 1;
+          if (left <= 0) coordinating.delete(missionId);
+          else coordinating.set(missionId, left);
+        }).pipe(Effect.andThen(PubSub.publish(changes, missionId))),
+    );
 
   const nowIso = DateTime.now.pipe(Effect.map(DateTime.formatIso));
   // The platform RNG failing is not a mission outcome a caller can handle.
@@ -256,6 +317,7 @@ const make = Effect.gen(function* () {
       decisions: missionDecisions,
       verificationRuns,
       events,
+      coordinating: coordinating.has(missionId),
     } satisfies GoAgentMissionSnapshot;
   });
 
@@ -313,8 +375,22 @@ const make = Effect.gen(function* () {
   const recordDecision = Effect.fn("GoAgentMissionService.recordDecision")(function* (
     missionId: GoAgentMissionId,
     request: GoAgentDecisionService.DecisionRequest,
+    about: { readonly taskKey?: string; readonly targetTaskKey?: string } = {},
   ) {
-    const outcome = yield* decisions.decide(request);
+    const asked = (yield* store
+      .listDecisions(missionId)
+      .pipe(Effect.orElseSucceed(() => []))).filter((d) => d.model !== null).length;
+    const outcome: GoAgentDecisionService.DecisionOutcome =
+      asked >= MAX_JEV_CALLS_PER_MISSION && decisions.status.available
+        ? {
+            answer: request.fallback.answer,
+            probabilities: {},
+            confidence: null,
+            model: null,
+            source: "fallback",
+            fallbackReason: `Jev budget of ${MAX_JEV_CALLS_PER_MISSION} calls for this mission is used; ${request.fallback.reason}`,
+          }
+        : yield* decisions.decide(request);
     const decision: GoAgentDecision = {
       decisionId: GoAgentDecisionId.make(yield* uuid),
       missionId,
@@ -328,6 +404,10 @@ const make = Effect.gen(function* () {
       source: outcome.source,
       fallbackReason: outcome.fallbackReason,
       createdAt: yield* nowIso,
+      ...(about.taskKey === undefined ? {} : { taskKey: about.taskKey as GoAgentTask["key"] }),
+      ...(about.targetTaskKey === undefined
+        ? {}
+        : { targetTaskKey: about.targetTaskKey as GoAgentTask["key"] }),
     };
     return decision;
   });
@@ -337,25 +417,27 @@ const make = Effect.gen(function* () {
     causedBy: GoAgentEventId | null = null,
   ) {
     yield* store.putDecision(decision).pipe(Effect.mapError(storage));
-    const percent =
-      decision.confidence === null ? "" : ` (${Math.round(decision.confidence * 100)}%)`;
+    const percent = (value: number) => `${Math.round(value * 100)}%`;
+    // A fallback's confidence is Jev's confidence in its own (rejected) answer, not in this one.
+    const detail =
+      decision.confidence === null
+        ? decision.source === "fallback"
+          ? " [fallback]"
+          : ""
+        : decision.source === "fallback"
+          ? ` [fallback; Jev was ${percent(decision.confidence)} sure]`
+          : ` (${percent(decision.confidence)})`;
     yield* emit({
       missionId: decision.missionId,
       type: "decision.made",
       actor: decision.source === "jev" ? "jev" : "goagent",
-      summary: `${decision.key} → ${decision.answer}${percent}${decision.source === "fallback" ? " [fallback]" : ""}`,
+      summary: `${decision.key} → ${decision.answer}${detail}`,
       payload: { decisionId: decision.decisionId },
       causedBy,
     });
   });
 
-  const readSuggestions = Effect.fn("GoAgentMissionService.readSuggestions")(function* (
-    root: string,
-  ) {
-    const packageJson = yield* fileSystem.readFileString(path.join(root, "package.json")).pipe(
-      Effect.flatMap(decodeJson),
-      Effect.orElseSucceed((): unknown => null),
-    );
+  const readLockfiles = Effect.fn("GoAgentMissionService.readLockfiles")(function* (root: string) {
     const lockfiles = new Set<string>();
     for (const name of [
       "pnpm-lock.yaml",
@@ -367,23 +449,40 @@ const make = Effect.gen(function* () {
       if (yield* fileSystem.exists(path.join(root, name)).pipe(Effect.orElseSucceed(() => false)))
         lockfiles.add(name);
     }
-    return suggestVerificationCommands(packageJson, lockfiles);
+    return lockfiles;
+  });
+
+  const readSuggestions = Effect.fn("GoAgentMissionService.readSuggestions")(function* (
+    root: string,
+  ) {
+    const packageJson = yield* fileSystem.readFileString(path.join(root, "package.json")).pipe(
+      Effect.flatMap(decodeJson),
+      Effect.orElseSucceed((): unknown => null),
+    );
+    return suggestVerificationCommands(packageJson, yield* readLockfiles(root));
   });
 
   const projectState = Effect.fn("GoAgentMissionService.projectState")(function* (
     projectId: ProjectId,
   ) {
     const project = yield* requireProject(projectId);
-    const [graphify, latestBaseScan, verificationCommands, missions, suggested] = yield* Effect.all(
-      [
-        graph.status,
-        graph.latestBaseScan(projectId),
-        store.getVerificationCommands(projectId).pipe(Effect.mapError(storage)),
-        store.listMissions(projectId).pipe(Effect.mapError(storage)),
-        readSuggestions(project.workspaceRoot),
-      ],
-      { concurrency: "unbounded" },
-    );
+    const [graphify, latestBaseScan, verificationCommands, missions, suggested, projectDecisions] =
+      yield* Effect.all(
+        [
+          graph.status,
+          graph.latestBaseScan(projectId),
+          store.getVerificationCommands(projectId).pipe(Effect.mapError(storage)),
+          store.listMissions(projectId).pipe(Effect.mapError(storage)),
+          readSuggestions(project.workspaceRoot),
+          store.listProjectDecisions(projectId).pipe(Effect.mapError(storage)),
+        ],
+        { concurrency: "unbounded" },
+      );
+    const decisionsFile = (yield* fileSystem
+      .exists(path.join(project.workspaceRoot, DECISIONS_FILE))
+      .pipe(Effect.orElseSucceed(() => false)))
+      ? DECISIONS_FILE
+      : null;
     return {
       projectId,
       graphify,
@@ -398,7 +497,72 @@ const make = Effect.gen(function* () {
         createdAt: m.createdAt,
         updatedAt: m.updatedAt,
       })),
+      projectDecisions,
+      decisionsFile,
     } satisfies GoAgentProjectState;
+  });
+
+  const addProjectDecision = Effect.fn("GoAgentMissionService.addProjectDecision")(function* (
+    projectId: ProjectId,
+    text: string,
+  ) {
+    yield* requireProject(projectId);
+    yield* store
+      .putProjectDecision({
+        decisionId: GoAgentProjectDecisionId.make(yield* uuid),
+        projectId,
+        text: text.trim().slice(0, MAX_PROJECT_DECISION_CHARS),
+        author: "user",
+        sourceFile: null,
+        createdAt: yield* nowIso,
+      })
+      .pipe(Effect.mapError(storage));
+    return yield* projectState(projectId);
+  });
+
+  /** Imports DECISIONS.md bullets as seeded decisions; text that is already recorded is skipped. */
+  const importProjectDecisions = Effect.fn("GoAgentMissionService.importProjectDecisions")(
+    function* (projectId: ProjectId) {
+      const project = yield* requireProject(projectId);
+      const markdown = yield* fileSystem
+        .readFileString(path.join(project.workspaceRoot, DECISIONS_FILE))
+        .pipe(
+          Effect.mapError(() =>
+            fail("project_not_found", `${DECISIONS_FILE} was not found at the project root.`),
+          ),
+        );
+      const existing = new Set(
+        (yield* store.listProjectDecisions(projectId).pipe(Effect.mapError(storage))).map(
+          (d) => d.text,
+        ),
+      );
+      for (const text of parseDecisionsFile(markdown)) {
+        if (existing.has(text)) continue;
+        existing.add(text);
+        yield* store
+          .putProjectDecision({
+            decisionId: GoAgentProjectDecisionId.make(yield* uuid),
+            projectId,
+            text,
+            author: "seeded",
+            sourceFile: DECISIONS_FILE,
+            createdAt: yield* nowIso,
+          })
+          .pipe(Effect.mapError(storage));
+      }
+      return yield* projectState(projectId);
+    },
+  );
+
+  const retireProjectDecision = Effect.fn("GoAgentMissionService.retireProjectDecision")(function* (
+    projectId: ProjectId,
+    decisionId: GoAgentProjectDecisionId,
+  ) {
+    const retired = yield* store
+      .retireProjectDecision({ projectId, decisionId, retiredAt: yield* nowIso })
+      .pipe(Effect.mapError(storage));
+    if (!retired) return yield* fail("decision_not_found", "The project decision was not found.");
+    return yield* projectState(projectId);
   });
 
   const indexProject = Effect.fn("GoAgentMissionService.indexProject")(function* (
@@ -455,6 +619,18 @@ const make = Effect.gen(function* () {
       Effect.map((commands) => commands.map((c) => c.id)),
     );
 
+  /** Adds the knowledge-graph coupling between the plan's tasks (absent without a graph). */
+  const withCoupling = (plan: GoAgentPlan, baseScanId: GoAgentScanId | null) =>
+    baseScanId === null || plan.tasks.length < 2
+      ? Effect.succeed(plan)
+      : store.getScanGraph(baseScanId).pipe(
+          Effect.map((rows): GoAgentPlan => ({
+            ...plan,
+            coupling: taskCoupling(plan.tasks, rows),
+          })),
+          Effect.orElseSucceed(() => plan),
+        );
+
   const createMission = Effect.fn("GoAgentMissionService.createMission")(function* (input: {
     readonly projectId: ProjectId;
     readonly request: string;
@@ -485,6 +661,7 @@ const make = Effect.gen(function* () {
     );
     if (route.answer === "single_agent" && plan.tasks.length > 1)
       plan = collapseToSingle(plan, input.request);
+    plan = yield* withCoupling(plan, Option.isSome(baseScan) ? baseScan.value.scanId : null);
     const now = yield* nowIso;
     const mission: GoAgentMission = {
       missionId,
@@ -530,7 +707,11 @@ const make = Effect.gen(function* () {
           type: "plan.proposed",
           actor: "goagent",
           summary: `Plan v1: ${plan.tasks.map((t) => t.key).join(" ∥ ")}`,
-          payload: { planVersion: 1, tasks: plan.tasks.map((t) => t.key) },
+          payload: {
+            planVersion: 1,
+            tasks: plan.tasks.map((t) => t.key),
+            coupling: (plan.coupling ?? []).map((c) => `${c.from} uses ${c.to}: ${c.edgeCount}`),
+          },
           causedBy: created.eventId,
         });
       }),
@@ -565,7 +746,8 @@ const make = Effect.gen(function* () {
         const problems = validatePlan(input.plan, yield* approvedCommandIds(mission.projectId));
         if (problems.length > 0) return yield* fail("plan_invalid", problems.join(" "));
         const planVersion = mission.planVersion + 1;
-        yield* saveMission({ ...mission, plan: input.plan, title: input.plan.title, planVersion });
+        const plan = yield* withCoupling(input.plan, mission.baseScanId);
+        yield* saveMission({ ...mission, plan, title: plan.title, planVersion });
         yield* emit({
           missionId: mission.missionId,
           type: "plan.updated",
@@ -583,7 +765,9 @@ const make = Effect.gen(function* () {
     readonly planVersion: number;
   }) {
     const mission = yield* requireMission(input.missionId);
-    yield* requireState(mission, ["planned"], "approve");
+    // A plan held for review after a high risk rating is approved by approving it again.
+    const confirmingReview = mission.state === "needs_review" && mission.baseSha === null;
+    if (!confirmingReview) yield* requireState(mission, ["planned"], "approve");
     if (mission.planVersion !== input.planVersion)
       return yield* fail(
         "plan_version_mismatch",
@@ -591,6 +775,29 @@ const make = Effect.gen(function* () {
       );
     const problems = validatePlan(mission.plan, yield* approvedCommandIds(mission.projectId));
     if (problems.length > 0) return yield* fail("plan_invalid", problems.join(" "));
+    if (confirmingReview) {
+      yield* mutate(
+        mission.missionId,
+        Effect.gen(function* () {
+          const current = yield* requireMission(input.missionId);
+          if (current.state !== "needs_review" || current.baseSha !== null)
+            return yield* fail(
+              "invalid_state",
+              `Cannot approve a mission that is ${current.state}.`,
+            );
+          yield* saveMission({ ...current, state: "approved", failureReason: null });
+          yield* emit({
+            missionId: current.missionId,
+            type: "plan.approved",
+            actor: "user",
+            summary: `Plan v${current.planVersion} approved after reviewing its high risk rating`,
+            payload: { planVersion: current.planVersion, riskAcknowledged: true },
+            causedBy: yield* latestEventOfType(current.missionId, "plan.review_required"),
+          });
+        }),
+      );
+      return yield* snapshot(input.missionId);
+    }
     const hubFiles = mission.baseScanId === null ? [] : yield* hubFilesTouched(mission);
     const risk = yield* recordDecision(
       mission.missionId,
@@ -601,6 +808,20 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const current = yield* requireMission(input.missionId);
         yield* requireState(current, ["planned"], "approve");
+        if (risk.answer === "high") {
+          // GoAgent.md §9.1: a high risk rating holds the plan for an explicit second approval.
+          const reason = `Rated high risk${risk.source === "jev" ? " by Jev" : ""}; approve again to start.`;
+          yield* saveMission({ ...current, state: "needs_review", failureReason: reason });
+          const held = yield* emit({
+            missionId: current.missionId,
+            type: "plan.review_required",
+            actor: "goagent",
+            summary: `Plan v${current.planVersion} needs review: ${reason}`,
+            payload: { planVersion: current.planVersion, decisionId: risk.decisionId },
+          });
+          yield* persistDecision(risk, held.eventId);
+          return;
+        }
         yield* saveMission({ ...current, state: "approved" });
         const approved = yield* emit({
           missionId: current.missionId,
@@ -690,6 +911,11 @@ const make = Effect.gen(function* () {
     const planTask = mission.plan.tasks.find((t) => t.key === task.key)!;
     const launch = yield* resolveLaunchSettings(mission.projectId);
     const context = yield* graphContextFor(mission, planTask.ownsPaths);
+    const project = yield* requireProject(mission.projectId);
+    const packageManager = packageManagerFor(yield* readLockfiles(project.workspaceRoot));
+    const projectDecisions = yield* store
+      .listProjectDecisions(mission.projectId)
+      .pipe(Effect.mapError(storage));
     const commandId = CommandId.make(`goagent:${mission.missionId}:${task.key}:${yield* uuid}`);
     const threadId = ThreadId.make(yield* uuid);
     const text = renderTaskPrompt({
@@ -698,15 +924,18 @@ const make = Effect.gen(function* () {
       task: planTask,
       graphContext: context.text,
       contract,
+      packageManager,
+      projectDecisions,
     });
     const contextEvent = yield* emit({
       missionId: mission.missionId,
       type: "context.built",
       actor: "goagent",
-      summary: `Context for ${task.key}: ${context.nodeIds.length} graph nodes`,
+      summary: `Context for ${task.key}: ${context.nodeIds.length} graph nodes, ${projectDecisions.length} project decision(s)`,
       payload: {
         taskKey: task.key,
         nodeIds: context.nodeIds.slice(0, 100),
+        projectDecisionIds: projectDecisions.map((d) => d.decisionId),
         contractVersion: contract?.version ?? null,
       },
       causedBy,
@@ -751,6 +980,42 @@ const make = Effect.gen(function* () {
     return started;
   });
 
+  /**
+   * Launches a task; if its agent cannot start, the task is failed and the mission is held for
+   * review with the reason, instead of staying "running" with nothing behind it. Runs inside
+   * `mutate`.
+   */
+  const launchOrFail = (
+    mission: GoAgentMission,
+    task: GoAgentTask,
+    contract: GoAgentContract | null,
+    causedBy: GoAgentEventId | null,
+  ) =>
+    launchTask(mission, task, contract, causedBy).pipe(
+      Effect.catch((error) =>
+        Effect.gen(function* () {
+          const reason = `${task.key} could not start: ${error.message}`;
+          yield* saveTask({
+            ...task,
+            state: "failed",
+            failureReason: error.message,
+            finishedAt: yield* nowIso,
+          });
+          const current = yield* requireMission(mission.missionId);
+          yield* saveMission({ ...current, state: "needs_review", failureReason: reason });
+          yield* emit({
+            missionId: mission.missionId,
+            type: "task.failed",
+            actor: "goagent",
+            summary: reason,
+            payload: { taskKey: task.key, code: error.code },
+            causedBy,
+          });
+          return null;
+        }),
+      ),
+    );
+
   const startMission = Effect.fn("GoAgentMissionService.startMission")(function* (
     missionId: GoAgentMissionId,
   ) {
@@ -766,6 +1031,8 @@ const make = Effect.gen(function* () {
             "not_a_git_repository",
             "GoAgent needs the project to be a git repository with at least one commit.",
           );
+        // Fail before anything changes when agents cannot be launched (e.g. no default model).
+        yield* resolveLaunchSettings(mission.projectId);
         const status = yield* gitRun("status", project.workspaceRoot, ["status", "--porcelain"]);
         const dirty = status.stdout.trim().length > 0;
         const running: GoAgentMission = { ...mission, state: "running", baseSha };
@@ -832,7 +1099,7 @@ const make = Effect.gen(function* () {
               causedBy: started.eventId,
             });
           } else {
-            yield* launchTask(running, task, contract, started.eventId);
+            yield* launchOrFail(running, task, contract, started.eventId);
           }
         }
       }),
@@ -875,7 +1142,7 @@ const make = Effect.gen(function* () {
         payload: { taskKey: task.key, was: task.blockedOn },
         causedBy,
       });
-      yield* launchTask(mission, task, contract, unblocked.eventId);
+      yield* launchOrFail(mission, task, contract, unblocked.eventId);
     }
   });
 
@@ -965,17 +1232,36 @@ const make = Effect.gen(function* () {
           },
         });
         const mission = yield* requireMission(decision.missionId);
+        if (decision.key === "contract.match" && input.answer === "true") {
+          const tasks = yield* store.listTasks(mission.missionId).pipe(Effect.mapError(storage));
+          for (const reviewed of tasks) {
+            const remaining = reviewed.blockedOn.filter(
+              (b) => !b.startsWith(CONTRACT_REVIEW_PREFIX),
+            );
+            if (remaining.length === reviewed.blockedOn.length) continue;
+            yield* saveTask({ ...reviewed, blockedOn: remaining });
+            yield* emit({
+              missionId: mission.missionId,
+              type: "task.unblocked",
+              actor: "user",
+              summary: `${reviewed.key}: contract acknowledgment accepted by the user`,
+              payload: { taskKey: reviewed.key, was: reviewed.blockedOn },
+            });
+          }
+        }
         if (decision.key === "mission.route" && mission.state === "planned") {
           const files = mission.plan.tasks.flatMap((t) => t.ownsPaths);
           const project = yield* requireProject(mission.projectId);
-          const plan =
+          const plan = yield* withCoupling(
             input.answer === "single_agent"
               ? collapseToSingle(mission.plan, mission.request, files)
               : buildPlan({
                   request: mission.request,
                   files: yield* trackedFiles(project.workspaceRoot),
                   verificationCommandIds: mission.plan.verificationCommandIds,
-                });
+                }),
+            mission.baseScanId,
+          );
           const planVersion = mission.planVersion + 1;
           yield* saveMission({ ...mission, plan, planVersion });
           yield* emit({
@@ -1133,7 +1419,20 @@ const make = Effect.gen(function* () {
           yield* persistDecision(match, ack.eventId);
           const fresh = yield* store.listTasks(task.missionId).pipe(Effect.mapError(storage));
           const self = fresh.find((t) => t.key === task.key);
-          if (self !== undefined && self.blockedOn.length > 0) {
+          // Jev leaning "mismatch" holds integration for a human; it never unblocks anything.
+          const doubted = (match.probabilities["true"] ?? 1) < 0.5;
+          if (self !== undefined && doubted) {
+            const review = `${CONTRACT_REVIEW_PREFIX} v${input.version} acknowledgment may not match`;
+            yield* saveTask({ ...self, blockedOn: [review] });
+            yield* emit({
+              missionId: task.missionId,
+              type: "task.blocked",
+              actor: "goagent",
+              summary: `${task.key}: Jev doubts the acknowledgment matches contract v${input.version}; override the contract.match decision to accept it`,
+              payload: { taskKey: task.key, blockedOn: [review], decisionId: match.decisionId },
+              causedBy: ack.eventId,
+            });
+          } else if (self !== undefined && self.blockedOn.length > 0) {
             yield* saveTask({ ...self, blockedOn: [] });
             yield* emit({
               missionId: task.missionId,
@@ -1149,6 +1448,152 @@ const make = Effect.gen(function* () {
       return acknowledged;
     },
   );
+
+  const agentRecordDecision = Effect.fn("GoAgentMissionService.agentRecordDecision")(function* (
+    caller: AgentCaller,
+    input: { readonly decision: string; readonly reason: string },
+  ) {
+    const task = yield* requireCallerTask(caller);
+    const events = yield* store
+      .listEvents(task.missionId, EVENT_TAIL)
+      .pipe(Effect.mapError(storage));
+    const mine = events.filter(
+      (e) => e.type === "agent.decision" && e.actor === `task:${task.key}`,
+    );
+    if (mine.length >= MAX_AGENT_DECISIONS_PER_TASK)
+      return yield* fail(
+        "invalid_state",
+        `You have recorded ${MAX_AGENT_DECISIONS_PER_TASK} decisions; record only the significant ones.`,
+      );
+    yield* mutate(
+      task.missionId,
+      emit({
+        missionId: task.missionId,
+        type: "agent.decision",
+        actor: `task:${task.key}`,
+        summary: `${task.key}: ${input.decision.slice(0, 160)}`,
+        payload: {
+          taskKey: task.key,
+          decision: input.decision.slice(0, 500),
+          reason: input.reason.slice(0, 1_000),
+        },
+      }),
+    );
+    return { recorded: mine.length + 1 };
+  });
+
+  /** An agent hands a note to "whoever needs it"; Jev picks the receiving agent. */
+  const agentHandoff = Effect.fn("GoAgentMissionService.agentHandoff")(function* (
+    caller: AgentCaller,
+    input: { readonly note: string; readonly files: ReadonlyArray<string> },
+  ) {
+    const task = yield* requireCallerTask(caller);
+    const mission = yield* requireMission(task.missionId);
+    yield* requireState(mission, ["running"], "hand off work in");
+    if ((yield* handoffCount(mission.missionId)).length >= MAX_HANDOFFS_PER_MISSION)
+      return yield* fail(
+        "invalid_state",
+        "This mission's handoff budget is used; finish your part and mention the issue in your summary.",
+      );
+    const tasks = yield* store.listTasks(mission.missionId).pipe(Effect.mapError(storage));
+    const candidates = tasks.filter(
+      (t) =>
+        t.key !== task.key && t.threadId !== null && ["running", "completed"].includes(t.state),
+    );
+    const planned = mission.plan.tasks.filter((t) => candidates.some((c) => c.key === t.key));
+    const owners = input.files
+      .map((file) => ownerOfPath(planned, file))
+      .filter((owner): owner is string => owner !== null);
+    const fileOwner =
+      owners.length === 0
+        ? null
+        : [...new Set(owners)].toSorted(
+            (a, b) => owners.filter((o) => o === b).length - owners.filter((o) => o === a).length,
+          )[0]!;
+    const strongest = (mission.plan.coupling ?? [])
+      .filter(
+        (c) =>
+          (c.from === task.key && planned.some((t) => t.key === c.to)) ||
+          (c.to === task.key && planned.some((t) => t.key === c.from)),
+      )
+      .toSorted((a, b) => b.edgeCount - a.edgeCount)[0];
+    const decision = yield* recordDecision(
+      mission.missionId,
+      handoffRouteDecision({
+        fromTask: task.key,
+        note: input.note,
+        files: input.files,
+        candidates: planned,
+        fileOwner,
+        strongestCoupling:
+          strongest === undefined
+            ? null
+            : strongest.from === task.key
+              ? strongest.to
+              : strongest.from,
+      }),
+      { taskKey: task.key },
+    );
+    const target = candidates.find((t) => t.key === decision.answer);
+    const routed = target === undefined ? decision : { ...decision, targetTaskKey: target.key };
+    yield* mutate(
+      mission.missionId,
+      Effect.gen(function* () {
+        yield* persistDecision(routed);
+        if (target === undefined) return;
+        const current = (yield* store
+          .listTasks(mission.missionId)
+          .pipe(Effect.mapError(storage))).find((t) => t.key === target.key);
+        if (current === undefined || current.threadId === null) return;
+        yield* sendHandoff({
+          mission,
+          from: task.key,
+          to: current,
+          text: renderHandoffMessage({
+            fromTask: task.key,
+            changedFiles: input.files,
+            links: [],
+            note: input.note.slice(0, 1_500),
+            contract: yield* latestContract(mission.missionId),
+          }),
+          summary: `Switched to ${target.key}: note from ${task.key}`,
+          decisionId: decision.decisionId,
+          causedBy: null,
+        });
+      }),
+    );
+    return {
+      routedTo: target?.key ?? null,
+      source: decision.source,
+      confidence: decision.confidence,
+    };
+  });
+
+  /** Records an agent's graph tool call in the mission audit (GoAgent.md AC-03). */
+  const auditGraphQuery = (
+    caller: AgentCaller,
+    what: string,
+    payload: { readonly nodeIds: ReadonlyArray<string> } & Record<string, unknown>,
+  ) =>
+    requireCallerTask(caller).pipe(
+      Effect.flatMap((task) =>
+        mutate(
+          task.missionId,
+          emit({
+            missionId: task.missionId,
+            type: "graph.queried",
+            actor: `task:${task.key}`,
+            summary: `${task.key} ${what}: ${payload.nodeIds.length} result(s)`,
+            payload: {
+              ...payload,
+              nodeIds: payload.nodeIds.slice(0, 40),
+              resultCount: payload.nodeIds.length,
+            },
+          }),
+        ),
+      ),
+      Effect.asVoid,
+    );
 
   const callerScan = (caller: AgentCaller) =>
     requireCallerTask(caller).pipe(
@@ -1306,12 +1751,14 @@ const make = Effect.gen(function* () {
     );
     if (completedEvent === null) return;
     // Graph delta runs after the lock is released; it can take seconds.
-    yield* indexTaskWorktree(
+    const completedEventId = (completedEvent as GoAgentEvent).eventId;
+    const taskScanId = yield* indexTaskWorktree(
       mission,
       task.key,
       worktreePath,
-      (completedEvent as GoAgentEvent).eventId,
+      completedEventId,
     ).pipe(
+      Effect.map(Option.some),
       Effect.catch((error) =>
         mutate(
           missionId,
@@ -1322,9 +1769,282 @@ const make = Effect.gen(function* () {
             summary: `Graph for ${task.key} could not be built: ${error.message}`,
             payload: { taskKey: task.key, failed: true },
           }),
-        ).pipe(Effect.ignore),
+        ).pipe(Effect.ignore, Effect.as(Option.none<GoAgentScanId>())),
       ),
     );
+    yield* handoffAfterCompletion({
+      missionId,
+      fromTask: task.key,
+      changedFiles: diff,
+      scanId: Option.getOrNull(taskScanId) ?? mission.baseScanId,
+      causedBy: completedEventId,
+    }).pipe(
+      Effect.catch((error) =>
+        Effect.logWarning("GoAgent handoff coordination failed", { error: error.message }),
+      ),
+    );
+    yield* finishRepairRound(missionId);
+  });
+
+  /**
+   * A completed run is handled while the mission is marked coordinating, from before the task is
+   * marked completed until its graph delta and handoff decisions are done, so integration cannot
+   * slip in between and merge work an agent is about to be switched back onto.
+   */
+  const settleRun = (run: OrchestrationV2Run) =>
+    run.status !== "completed"
+      ? onRunSettled(run)
+      : store.findTaskByThread(run.threadId).pipe(
+          Effect.mapError(storage),
+          Effect.flatMap((found) =>
+            Option.isNone(found)
+              ? Effect.void
+              : whileCoordinating(found.value.missionId, onRunSettled(run)),
+          ),
+        );
+
+  const handoffCount = (missionId: GoAgentMissionId) =>
+    store.listEvents(missionId, EVENT_TAIL).pipe(
+      Effect.mapError(storage),
+      Effect.map((events) => events.filter((e) => e.type === "handoff.sent")),
+    );
+
+  /** Switches work to another agent's thread and records it. Runs inside `mutate`. */
+  const sendHandoff = Effect.fn("GoAgentMissionService.sendHandoff")(function* (input: {
+    readonly mission: GoAgentMission;
+    readonly from: string;
+    readonly to: GoAgentTask;
+    readonly text: string;
+    readonly summary: string;
+    readonly decisionId: GoAgentDecisionId;
+    readonly causedBy: GoAgentEventId | null;
+  }) {
+    const threadId = input.to.threadId!;
+    const commandId = CommandId.make(`goagent:handoff:${threadId}:${yield* uuid}`);
+    yield* threads
+      .sendToThread({
+        projectId: input.mission.projectId,
+        commandId,
+        threadId,
+        messageId: MessageId.make(commandId),
+        text: input.text,
+        attachments: [],
+        mode: "auto",
+        createdBy: "system",
+        creationSource: "server",
+      })
+      .pipe(
+        Effect.mapError(() =>
+          fail("provider_unavailable", `Could not hand work to ${input.to.key}.`),
+        ),
+      );
+    // A finished agent works again; its run settles into `completed` once more.
+    if (input.to.state === "completed")
+      yield* saveTask({ ...input.to, state: "running", finishedAt: null });
+    yield* emit({
+      missionId: input.mission.missionId,
+      type: "handoff.sent",
+      actor: "goagent",
+      summary: input.summary,
+      payload: { from: input.from, to: input.to.key, decisionId: input.decisionId },
+      causedBy: input.causedBy,
+    });
+  });
+
+  /**
+   * When an agent finishes, every other agent whose code uses the changed files (per the knowledge
+   * graph) is a candidate; Jev decides for each whether to switch to it now. Each ordered pair is
+   * handed off at most once per mission, and the mission has a handoff budget.
+   */
+  const handoffAfterCompletion = Effect.fn("GoAgentMissionService.handoffAfterCompletion")(
+    function* (input: {
+      readonly missionId: GoAgentMissionId;
+      readonly fromTask: string;
+      readonly changedFiles: ReadonlyArray<string>;
+      readonly scanId: GoAgentScanId | null;
+      readonly causedBy: GoAgentEventId;
+    }) {
+      if (input.scanId === null || input.changedFiles.length === 0) return;
+      const mission = yield* requireMission(input.missionId);
+      if (mission.state !== "running") return;
+      const rows = yield* store.getScanGraph(input.scanId).pipe(Effect.mapError(storage));
+      const impacted = impactedTasks({
+        tasks: mission.plan.tasks,
+        fromTask: input.fromTask,
+        changedFiles: input.changedFiles,
+        graph: rows,
+      });
+      for (const impact of impacted) {
+        const sent = yield* handoffCount(input.missionId);
+        if (sent.length >= MAX_HANDOFFS_PER_MISSION) return;
+        if (sent.some((e) => e.payload.from === input.fromTask && e.payload.to === impact.taskKey))
+          continue;
+        const tasks = yield* store.listTasks(input.missionId).pipe(Effect.mapError(storage));
+        const target = tasks.find((t) => t.key === impact.taskKey);
+        // Agents not started yet get the latest state in their first prompt instead.
+        if (target === undefined || target.threadId === null) continue;
+        if (!["running", "completed"].includes(target.state)) continue;
+        const decision = yield* recordDecision(
+          input.missionId,
+          handoffNotifyDecision({
+            fromTask: input.fromTask,
+            toTask: { key: target.key, title: target.title, state: target.state },
+            changedFiles: input.changedFiles,
+            links: impact.links,
+          }),
+          { taskKey: input.fromTask, targetTaskKey: target.key },
+        );
+        yield* mutate(
+          input.missionId,
+          Effect.gen(function* () {
+            yield* persistDecision(decision, input.causedBy);
+            if (decision.answer !== "notify") return;
+            const current = (yield* store
+              .listTasks(input.missionId)
+              .pipe(Effect.mapError(storage))).find((t) => t.key === target.key);
+            if (current === undefined || current.threadId === null) return;
+            yield* sendHandoff({
+              mission,
+              from: input.fromTask,
+              to: current,
+              text: renderHandoffMessage({
+                fromTask: input.fromTask,
+                changedFiles: input.changedFiles,
+                links: impact.links,
+                note: null,
+                contract: yield* latestContract(input.missionId),
+              }),
+              summary: `Switched to ${target.key}: ${input.fromTask}'s changes touch its code (${impact.links.length} graph link(s))`,
+              decisionId: decision.decisionId,
+              causedBy: input.causedBy,
+            });
+          }),
+        );
+      }
+    },
+  );
+
+  /**
+   * After the repairing agent finishes, re-integrate and re-verify with the already approved
+   * commands (GoAgent.md §11). Runs once per repair round: only while that round has not been
+   * integrated yet and every task is completed again.
+   */
+  const finishRepairRound = Effect.fn("GoAgentMissionService.finishRepairRound")(function* (
+    missionId: GoAgentMissionId,
+  ) {
+    const events = yield* store.listEvents(missionId, EVENT_TAIL).pipe(Effect.mapError(storage));
+    const lastRepair = events.findLast((event) => event.type === "repair.requested");
+    if (lastRepair === undefined) return;
+    if (events.some((e) => e.type === "integration.started" && e.sequence > lastRepair.sequence))
+      return;
+    const mission = yield* requireMission(missionId);
+    if (mission.state !== "running") return;
+    const tasks = yield* store.listTasks(missionId).pipe(Effect.mapError(storage));
+    if (!tasks.every((task) => task.state === "completed")) return;
+    const integrated = yield* integrateMission(missionId, "goagent");
+    if (integrated.mission.integration.status !== "completed") return;
+    yield* verifyMission({ missionId });
+  });
+
+  const requestRepair = Effect.fn("GoAgentMissionService.requestRepair")(function* (input: {
+    readonly missionId: GoAgentMissionId;
+    readonly taskKey?: string | undefined;
+  }) {
+    const mission = yield* requireMission(input.missionId);
+    yield* requireState(mission, ["needs_review"], "repair");
+    const runs = yield* store
+      .listVerificationRuns(mission.missionId)
+      .pipe(Effect.mapError(storage));
+    const failed = runs.findLast((run) => run.status === "failed" || run.status === "timed_out");
+    if (failed === undefined || mission.integration.status !== "completed")
+      return yield* fail(
+        "invalid_state",
+        "Repair needs a failed verification of the integrated code.",
+      );
+    const events = yield* store
+      .listEvents(mission.missionId, EVENT_TAIL)
+      .pipe(Effect.mapError(storage));
+    if (events.filter((event) => event.type === "repair.requested").length >= MAX_REPAIR_ROUNDS)
+      return yield* fail(
+        "invalid_state",
+        "The one repair round for this mission is used. Fix the remaining failure by hand.",
+      );
+    const owner = (yield* store.listDecisions(mission.missionId).pipe(Effect.mapError(storage)))
+      .filter((decision) => decision.key === "failure.owner")
+      .toSorted((a, b) => a.createdAt.localeCompare(b.createdAt))
+      .at(-1);
+    const taskKey = input.taskKey ?? owner?.answer;
+    if (taskKey === undefined || taskKey === "unknown")
+      return yield* fail(
+        "invalid_state",
+        "No agent was identified as the owner of this failure. Choose one to send the repair to.",
+      );
+    const tasks = yield* store.listTasks(mission.missionId).pipe(Effect.mapError(storage));
+    const task = tasks.find((t) => t.key === taskKey);
+    const planTask = mission.plan.tasks.find((t) => t.key === taskKey);
+    if (task === undefined || planTask === undefined || task.threadId === null)
+      return yield* fail("invalid_state", `Task "${taskKey}" has no agent thread to repair with.`);
+    const threadId = task.threadId;
+    const command = (yield* store
+      .getVerificationCommands(mission.projectId)
+      .pipe(Effect.mapError(storage))).find((c) => c.id === failed.commandId);
+    const reason =
+      input.taskKey !== undefined || owner === undefined
+        ? "the user chose this task"
+        : owner.source === "jev"
+          ? `Jev picked this task (${Math.round((owner.confidence ?? 0) * 100)}%)`
+          : owner.source === "human_override"
+            ? "the user picked this task"
+            : (owner.fallbackReason ?? "the fallback rule picked this task");
+    const text = renderRepairBrief({
+      task: planTask,
+      command: command?.label ?? failed.argv.join(" "),
+      status: failed.status,
+      exitCode: failed.exitCode,
+      logExcerpt: failed.outputExcerpt,
+      contract: yield* latestContract(mission.missionId),
+      reason,
+    });
+    yield* mutate(
+      mission.missionId,
+      Effect.gen(function* () {
+        const current = yield* requireMission(mission.missionId);
+        yield* requireState(current, ["needs_review"], "repair");
+        const commandId = CommandId.make(`goagent:repair:${threadId}:${yield* uuid}`);
+        yield* threads
+          .sendToThread({
+            projectId: mission.projectId,
+            commandId,
+            threadId,
+            messageId: MessageId.make(commandId),
+            text,
+            attachments: [],
+            mode: "auto",
+            createdBy: "system",
+            creationSource: "server",
+          })
+          .pipe(
+            Effect.mapError(() =>
+              fail("provider_unavailable", `Could not send the repair brief to ${task.key}.`),
+            ),
+          );
+        yield* saveTask({ ...task, state: "running", failureReason: null, finishedAt: null });
+        yield* saveMission({ ...current, state: "running", failureReason: null });
+        yield* emit({
+          missionId: mission.missionId,
+          type: "repair.requested",
+          actor: input.taskKey === undefined ? "goagent" : "user",
+          summary: `Repair sent to ${task.key} after ${failed.commandId} ${failed.status}`,
+          payload: {
+            taskKey: task.key,
+            runId: failed.runId,
+            decisionId: owner?.decisionId ?? null,
+          },
+          causedBy: yield* latestEventOfType(mission.missionId, "verification.finished"),
+        });
+      }),
+    );
+    return yield* snapshot(mission.missionId);
   });
 
   const indexTaskWorktree = Effect.fn("GoAgentMissionService.indexTaskWorktree")(function* (
@@ -1376,19 +2096,34 @@ const make = Effect.gen(function* () {
           });
       }),
     );
+    return scan.scanId;
   });
 
   const integrateMission = Effect.fn("GoAgentMissionService.integrateMission")(function* (
     missionId: GoAgentMissionId,
+    actor: "user" | "goagent" = "user",
   ) {
     const mission = yield* requireMission(missionId);
     yield* requireState(mission, ["running", "needs_review"], "integrate");
     const tasks = yield* store.listTasks(missionId).pipe(Effect.mapError(storage));
+    if (coordinating.has(missionId))
+      return yield* fail(
+        "invalid_state",
+        "GoAgent is still coordinating a finished agent (graph update and handoffs). Try again in a moment.",
+      );
     const unfinished = tasks.filter((t) => t.state !== "completed");
     if (unfinished.length > 0)
       return yield* fail(
         "invalid_state",
         `Waiting for: ${unfinished.map((t) => `${t.key} (${t.state})`).join(", ")}.`,
+      );
+    const underReview = tasks.filter((t) =>
+      t.blockedOn.some((b) => b.startsWith(CONTRACT_REVIEW_PREFIX)),
+    );
+    if (underReview.length > 0)
+      return yield* fail(
+        "contract_version_mismatch",
+        `Review the contract acknowledgment of ${underReview.map((t) => t.key).join(", ")} first (Decisions panel, contract.match).`,
       );
     const contract = yield* latestContract(missionId);
     for (const planTask of mission.plan.tasks) {
@@ -1402,6 +2137,25 @@ const make = Effect.gen(function* () {
           "contract_version_mismatch",
           `${planTask.key} has not acknowledged contract v${contract.version}; integration would combine incompatible work.`,
         );
+    }
+    // Integrate what each task worktree holds now, so commits made there after the agent
+    // finished (a repair, or a conflict fixed by hand) are not silently dropped.
+    const refreshed: Array<{
+      readonly key: string;
+      readonly from: string | null;
+      readonly to: string;
+    }> = [];
+    const heads = new Map<string, string | null>();
+    for (const task of tasks) {
+      const current =
+        task.worktreePath === null
+          ? null
+          : yield* headSha(task.worktreePath).pipe(Effect.orElseSucceed(() => null));
+      if (current !== null && current !== task.headSha) {
+        refreshed.push({ key: task.key, from: task.headSha, to: current });
+        yield* mutate(missionId, saveTask({ ...task, headSha: current }));
+      }
+      heads.set(task.key, current ?? task.headSha);
     }
     const project = yield* requireProject(mission.projectId);
     const integrationPath = path.join(worktreesDir, `goagent-${missionId.slice(0, 8)}-integration`);
@@ -1422,8 +2176,12 @@ const make = Effect.gen(function* () {
         return yield* emit({
           missionId,
           type: "integration.started",
-          actor: "user",
-          summary: "Integration started in a dedicated worktree",
+          actor,
+          summary:
+            refreshed.length === 0
+              ? "Integration started in a dedicated worktree"
+              : `Integration started; newer commits found in ${refreshed.map((r) => r.key).join(", ")}`,
+          payload: { refreshedHeads: refreshed },
         });
       }),
     );
@@ -1487,8 +2245,8 @@ const make = Effect.gen(function* () {
     }
     const applied: Array<string> = [];
     for (const key of integrationOrder(mission.plan.tasks)) {
-      const task = tasks.find((t) => t.key === key)!;
-      if (task.headSha === null || task.headSha === mission.baseSha) {
+      const head = heads.get(key) ?? null;
+      if (head === null || head === mission.baseSha) {
         applied.push(key);
         continue;
       }
@@ -1497,7 +2255,7 @@ const make = Effect.gen(function* () {
         "cherry-pick",
         "--allow-empty",
         "--keep-redundant-commits",
-        `${mission.baseSha}..${task.headSha}`,
+        `${mission.baseSha}..${head}`,
       ]);
       if (pick.exitCode !== 0) {
         const conflicts = yield* gitRun("conflicts", integrationPath, [
@@ -1723,7 +2481,7 @@ const make = Effect.gen(function* () {
   yield* orchestrator.streamDomainEvents.pipe(
     Stream.filter((event) => event.type === "run.updated" || event.type === "run.created"),
     Stream.runForEach((event) =>
-      onRunSettled(event.payload as OrchestrationV2Run).pipe(
+      settleRun(event.payload as OrchestrationV2Run).pipe(
         Effect.catch((error) =>
           Effect.logWarning("GoAgent could not settle a task run", { error: error.message }),
         ),
@@ -1763,7 +2521,7 @@ const make = Effect.gen(function* () {
             }),
           ).pipe(Effect.ignore);
         } else if (!ACTIVE_RUN_STATUSES.has(latest.status)) {
-          yield* onRunSettled(latest).pipe(Effect.ignore);
+          yield* settleRun(latest).pipe(Effect.ignore);
         }
       }
     }
@@ -1775,18 +2533,45 @@ const make = Effect.gen(function* () {
   );
 
   return GoAgentMissionService.of({
+    updateProjectDecisions: (projectId, change) =>
+      change.type === "add"
+        ? addProjectDecision(projectId, change.text)
+        : change.type === "import"
+          ? importProjectDecisions(projectId)
+          : retireProjectDecision(projectId, change.decisionId),
+    agentRecordDecision,
+    agentHandoff,
+    agentProjectDecisions: (caller) =>
+      requireCallerTask(caller).pipe(
+        Effect.flatMap((task) => requireMission(task.missionId)),
+        Effect.flatMap((mission) =>
+          store.listProjectDecisions(mission.projectId).pipe(Effect.mapError(storage)),
+        ),
+      ),
+    requestRepair,
     projectState,
     indexProject,
     getGraph: Effect.fn("GoAgentMissionService.getGraph")(function* (input) {
       yield* requireProject(input.projectId);
+      let snap: GoAgentGraphSnapshot;
       if (input.scanId !== undefined) {
-        const snap = yield* graph.snapshot(input.scanId);
+        snap = yield* graph.snapshot(input.scanId);
         if (snap.scan.projectId !== input.projectId)
           return yield* fail("scan_not_found", "The graph scan does not belong to this project.");
-        return snap;
+      } else {
+        const latest = yield* graph.latestBaseScan(input.projectId);
+        if (Option.isNone(latest)) return null;
+        snap = yield* graph.snapshot(latest.value.scanId);
       }
-      const latest = yield* graph.latestBaseScan(input.projectId);
-      return Option.isNone(latest) ? null : yield* graph.snapshot(latest.value.scanId);
+      const decided = decisionGraph(
+        yield* store.listProjectDecisions(input.projectId).pipe(Effect.mapError(storage)),
+        snap.nodes,
+      );
+      return {
+        ...snap,
+        nodes: [...snap.nodes, ...decided.nodes],
+        edges: [...snap.edges, ...decided.edges],
+      };
     }),
     getGraphDelta: (input) => graph.delta(input.baseScanId, input.scanId),
     setVerificationCommands,
@@ -1797,7 +2582,7 @@ const make = Effect.gen(function* () {
     startMission,
     cancelMission,
     overrideDecision,
-    integrateMission,
+    integrateMission: (missionId) => integrateMission(missionId),
     verifyMission,
     subscribeMission: (missionId) =>
       Stream.concat(
@@ -1811,11 +2596,25 @@ const make = Effect.gen(function* () {
     agentProposeContract,
     agentAcknowledgeContract,
     agentGraphSearch: (caller, query) =>
-      callerScan(caller).pipe(Effect.flatMap((scanId) => graph.search(scanId, query, 25))),
+      callerScan(caller).pipe(
+        Effect.flatMap((scanId) => graph.search(scanId, query, 25)),
+        Effect.tap((nodes) =>
+          auditGraphQuery(caller, `searched the graph for "${query.slice(0, 80)}"`, {
+            query: query.slice(0, 200),
+            nodeIds: nodes.map((n) => n.id),
+          }),
+        ),
+      ),
     agentGraphNeighbours: (caller, nodeIds, hops) =>
       callerScan(caller).pipe(
         Effect.flatMap((scanId) =>
           graph.neighbours(scanId, nodeIds, { hops: Math.min(Math.max(hops, 1), 3), maxNodes: 80 }),
+        ),
+        Effect.tap((result) =>
+          auditGraphQuery(caller, `explored ${nodeIds.length} node(s) of the graph`, {
+            seeds: nodeIds.slice(0, 20),
+            nodeIds: result.nodes.map((n) => n.id),
+          }),
         ),
       ),
   });

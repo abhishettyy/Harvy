@@ -391,6 +391,8 @@ import {
   GoAgentOverrideDecisionInput,
   GoAgentProjectInput,
   GoAgentProjectState,
+  GoAgentRequestRepairInput,
+  GoAgentUpdateProjectDecisionsInput,
   GoAgentSetVerificationCommandsInput,
   GoAgentUpdatePlanInput,
   GoAgentVerifyMissionInput,
@@ -613,6 +615,8 @@ export const WS_METHODS = {
   goagentOverrideDecision: "goagent.overrideDecision",
   goagentIntegrateMission: "goagent.integrateMission",
   goagentVerifyMission: "goagent.verifyMission",
+  goagentRequestRepair: "goagent.requestRepair",
+  goagentUpdateProjectDecisions: "goagent.updateProjectDecisions",
   goagentSubscribeMission: "goagent.subscribeMission",
 } as const;
 
@@ -686,6 +690,16 @@ const WsGoAgentIntegrateMissionRpc = Rpc.make(WS_METHODS.goagentIntegrateMission
 const WsGoAgentVerifyMissionRpc = Rpc.make(WS_METHODS.goagentVerifyMission, {
   payload: GoAgentVerifyMissionInput,
   success: GoAgentMissionSnapshot,
+  error: GoAgentRpcError,
+});
+const WsGoAgentRequestRepairRpc = Rpc.make(WS_METHODS.goagentRequestRepair, {
+  payload: GoAgentRequestRepairInput,
+  success: GoAgentMissionSnapshot,
+  error: GoAgentRpcError,
+});
+const WsGoAgentUpdateProjectDecisionsRpc = Rpc.make(WS_METHODS.goagentUpdateProjectDecisions, {
+  payload: GoAgentUpdateProjectDecisionsInput,
+  success: GoAgentProjectState,
   error: GoAgentRpcError,
 });
 const WsGoAgentSubscribeMissionRpc = Rpc.make(WS_METHODS.goagentSubscribeMission, {
@@ -2206,5 +2220,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsGoAgentOverrideDecisionRpc,
   WsGoAgentIntegrateMissionRpc,
   WsGoAgentVerifyMissionRpc,
+  WsGoAgentRequestRepairRpc,
+  WsGoAgentUpdateProjectDecisionsRpc,
   WsGoAgentSubscribeMissionRpc,
 ).middleware(RpcScopeAuthorization);

@@ -5,7 +5,12 @@ import { DecisionModel } from "effect/ai";
 import * as AiError from "effect/ai/AiError";
 
 import { interpretAnswer, makeWith, type DecisionRequest } from "./GoAgentDecisionService.ts";
-import { failureOwnerDecision, routeDecision } from "./goagentDecisions.ts";
+import {
+  failureOwnerDecision,
+  handoffNotifyDecision,
+  handoffRouteDecision,
+  routeDecision,
+} from "./goagentDecisions.ts";
 
 const plan = {
   title: "Edit profile",
@@ -71,6 +76,10 @@ describe("interpretAnswer", () => {
     assert.strictEqual(outcome.source, "fallback");
     assert.strictEqual(outcome.answer, "parallel");
     assert.include(outcome.fallbackReason ?? "", "below 0.6");
+    // What Jev said stays visible next to the fallback answer.
+    assert.deepStrictEqual(outcome.probabilities, { parallel: 0.45, single_agent: 0.55 });
+    assert.strictEqual(outcome.confidence, 0.55);
+    assert.strictEqual(outcome.model, "jev-latest");
   });
 
   it("maps probability answers to true/false", () => {
@@ -156,5 +165,33 @@ describe("failureOwnerDecision", () => {
   it("falls back to unknown when no task is singled out", () => {
     const request = failureOwnerDecision({ logExcerpt: "Error: timeout", tasks: plan.tasks });
     assert.strictEqual(request.fallback.answer, "unknown");
+  });
+});
+
+describe("coordination decisions", () => {
+  it("falls back to the knowledge graph for handoffs", () => {
+    const notify = handoffNotifyDecision({
+      fromTask: "backend",
+      toTask: { key: "tests", title: "Tests", state: "running" },
+      changedFiles: ["server/routes/profile.ts"],
+      links: ["tests/server/helpers.ts -> server/app.ts -> server/routes/profile.ts"],
+    });
+    assert.strictEqual(notify.fallback.answer, "notify");
+    const route = handoffRouteDecision({
+      fromTask: "frontend",
+      note: "updateProfile now sends displayName",
+      files: [],
+      candidates: [
+        { key: "backend", title: "Server side", ownsPaths: ["server/**"] },
+        { key: "tests", title: "Tests", ownsPaths: ["tests/**"] },
+      ],
+      fileOwner: null,
+      strongestCoupling: "tests",
+    });
+    assert.deepStrictEqual(
+      route.criteria.map((c) => c.label),
+      ["backend", "tests", "none"],
+    );
+    assert.strictEqual(route.fallback.answer, "tests");
   });
 });

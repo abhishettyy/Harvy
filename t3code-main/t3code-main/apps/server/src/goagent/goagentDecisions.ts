@@ -147,3 +147,92 @@ export function failureOwnerDecision(input: {
     },
   };
 }
+
+/**
+ * Micro-decision when an agent finishes: should GoAgent switch to another agent the knowledge
+ * graph links to the finished work, and tell it about the change now?
+ */
+export function handoffNotifyDecision(input: {
+  readonly fromTask: string;
+  readonly toTask: { readonly key: string; readonly title: string; readonly state: string };
+  readonly changedFiles: ReadonlyArray<string>;
+  readonly links: ReadonlyArray<string>;
+}): DecisionRequest {
+  return {
+    key: "handoff.notify",
+    kind: "classify",
+    question: `The ${input.fromTask} agent just finished. Should the ${input.toTask.key} agent be interrupted now with a summary of the changes its code is linked to?`,
+    criteria: [
+      {
+        label: "notify",
+        description:
+          "The changes affect names, data shapes or behaviour the other agent's code relies on, so it should check its work now.",
+      },
+      {
+        label: "skip",
+        description:
+          "The link is incidental (shared helper, unchanged interface); interrupting would waste the other agent's time.",
+      },
+    ],
+    input: {
+      finishedAgent: input.fromTask,
+      otherAgent: `${input.toTask.key}: ${input.toTask.title} (${input.toTask.state})`,
+      changedFiles: input.changedFiles.slice(0, 30).join("\n"),
+      graphLinks: input.links.join("\n"),
+    },
+    threshold: 0.6,
+    fallback: {
+      answer: input.links.length > 0 ? "notify" : "skip",
+      reason:
+        input.links.length > 0
+          ? "rule: the knowledge graph links the changed files to this agent's code"
+          : "rule: no graph link to this agent's code",
+    },
+  };
+}
+
+/**
+ * Micro-decision when an agent calls goagent_handoff: which other agent should receive its note?
+ * The fallback follows the files the note names, then the strongest graph coupling.
+ */
+export function handoffRouteDecision(input: {
+  readonly fromTask: string;
+  readonly note: string;
+  readonly files: ReadonlyArray<string>;
+  readonly candidates: ReadonlyArray<{
+    readonly key: string;
+    readonly title: string;
+    readonly ownsPaths: ReadonlyArray<string>;
+  }>;
+  readonly fileOwner: string | null;
+  readonly strongestCoupling: string | null;
+}): DecisionRequest {
+  const fallbackAnswer = input.fileOwner ?? input.strongestCoupling ?? "none";
+  return {
+    key: "handoff.route",
+    kind: "classify",
+    question: `The ${input.fromTask} agent wants to hand something to another agent. Which agent should receive it?`,
+    criteria: [
+      ...input.candidates.map((c) => ({
+        label: c.key,
+        description: `${c.title} (owns ${c.ownsPaths.join(", ")})`,
+      })),
+      { label: "none", description: "No other agent needs this; keep it with the sender." },
+    ],
+    input: {
+      from: input.fromTask,
+      note: input.note.slice(0, 1_500),
+      files: input.files.slice(0, 20).join("\n"),
+    },
+    threshold: 0.55,
+    fallback: {
+      answer: fallbackAnswer,
+      reason:
+        input.fileOwner !== null
+          ? "rule: the note names files this agent owns"
+          : input.strongestCoupling !== null
+            ? "rule: the agent most linked to the sender in the knowledge graph"
+            : "rule: no owner or graph link found",
+    },
+  };
+}

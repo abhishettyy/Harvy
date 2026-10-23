@@ -2427,6 +2427,9 @@ export const layerWsRpc = (
         [WS_METHODS.goagentOverrideDecision]: (input) => goagent.overrideDecision(input),
         [WS_METHODS.goagentIntegrateMission]: (input) => goagent.integrateMission(input.missionId),
         [WS_METHODS.goagentVerifyMission]: (input) => goagent.verifyMission(input),
+        [WS_METHODS.goagentRequestRepair]: (input) => goagent.requestRepair(input),
+        [WS_METHODS.goagentUpdateProjectDecisions]: (input) =>
+          goagent.updateProjectDecisions(input.projectId, input.change),
         [WS_METHODS.goagentSubscribeMission]: (input) => goagent.subscribeMission(input.missionId),
         [WS_METHODS.serverRefreshUsageRates]: (_input) => usage.refreshRates,
         [WS_METHODS.serverRetryResourceTelemetry]: (_input) => resourceTelemetry.retry,

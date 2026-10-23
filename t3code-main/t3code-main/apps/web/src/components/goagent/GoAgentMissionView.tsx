@@ -10,7 +10,10 @@ import type {
 } from "@t3tools/contracts";
 import { Link } from "@tanstack/react-router";
 import { Background, MarkerType, ReactFlow } from "@xyflow/react";
+import * as Cause from "effect/Cause";
+import { AsyncResult } from "effect/reactivity";
 import { useState } from "react";
+import type { AtomCommandResult } from "@t3tools/client-runtime/state/runtime";
 
 import { goagent } from "../../state/goagent";
 import { useAtomCommand } from "../../state/use-atom-command";
@@ -19,16 +22,19 @@ import { Input } from "../ui/input";
 import { Spinner } from "../ui/spinner";
 import { Textarea } from "../ui/textarea";
 import { StateBadge } from "./GoAgentStateBadge";
-import { buildMissionDag } from "./goagentLayout";
+import { buildMissionDag, nextStep, type NextStep } from "./goagentLayout";
 
 export function GoAgentMissionView({
   environmentId,
   snapshot,
   state,
+  agentModelMissing = false,
 }: {
   readonly environmentId: EnvironmentId;
   readonly snapshot: GoAgentMissionSnapshot;
   readonly state: GoAgentProjectState | null;
+  /** The project has no default model, so starting agents would fail. */
+  readonly agentModelMissing?: boolean;
 }) {
   const { mission } = snapshot;
   return (
@@ -47,12 +53,12 @@ export function GoAgentMissionView({
           )}
           <MissionActions environmentId={environmentId} snapshot={snapshot} />
         </div>
-        {mission.failureReason === null ? null : (
-          <p className="text-sm text-destructive-foreground">{mission.failureReason}</p>
-        )}
+        <NextStepBanner step={nextStep(snapshot, { agentModelMissing })} />
         <p className="text-sm text-muted-foreground">{mission.request}</p>
         {mission.state === "planned" ? (
           <PlanEditor environmentId={environmentId} snapshot={snapshot} state={state} />
+        ) : mission.baseSha === null ? (
+          <PlanSummary snapshot={snapshot} />
         ) : (
           <>
             <TaskList environmentId={environmentId} snapshot={snapshot} />
@@ -62,6 +68,59 @@ export function GoAgentMissionView({
         )}
       </div>
     </div>
+  );
+}
+
+const STEP_TONE: Record<NextStep["tone"], string> = {
+  action: "border-info/50 bg-info/8",
+  waiting: "border-border bg-muted/40",
+  done: "border-success/50 bg-success/8",
+  problem: "border-destructive/50 bg-destructive/8",
+};
+
+function NextStepBanner({ step }: { readonly step: NextStep }) {
+  return (
+    <div className={`flex flex-col gap-1 rounded-lg border p-3 ${STEP_TONE[step.tone]}`}>
+      <span className="flex items-center gap-2 text-sm font-medium">
+        {step.tone === "waiting" ? <Spinner /> : null}
+        {step.tone === "action" ? "Next: " : ""}
+        {step.title}
+      </span>
+      <span className="text-xs text-muted-foreground">{step.detail}</span>
+    </div>
+  );
+}
+
+/** The approved-but-not-started plan: who will work on what. */
+function PlanSummary({ snapshot }: { readonly snapshot: GoAgentMissionSnapshot }) {
+  const { plan } = snapshot.mission;
+  return (
+    <section className="flex flex-col gap-2">
+      <h3 className="text-xs font-medium uppercase text-muted-foreground">
+        Planned agents ({plan.tasks.length})
+      </h3>
+      {plan.tasks.map((task) => (
+        <div key={task.key} className="flex flex-col gap-1 rounded-md border p-3 text-sm">
+          <span className="flex items-center gap-2">
+            <span className="font-medium">{task.title}</span>
+            <code className="text-xs text-muted-foreground">{task.key}</code>
+            {task.proposesContract ? <StateBadge state="proposes contract" /> : null}
+          </span>
+          <span className="text-xs text-muted-foreground">Owns {task.ownsPaths.join(", ")}</span>
+          {task.dependsOn.length > 0 ? (
+            <span className="text-xs">Starts after: {task.dependsOn.join(", ")}</span>
+          ) : (
+            <span className="text-xs">Starts immediately</span>
+          )}
+        </div>
+      ))}
+      {(plan.coupling ?? []).length > 0 ? (
+        <p className="text-xs text-muted-foreground">
+          Knowledge graph:{" "}
+          {(plan.coupling ?? []).map((c) => `${c.from} uses ${c.to} (${c.edgeCount})`).join(" · ")}
+        </p>
+      ) : null}
+    </section>
   );
 }
 
@@ -120,20 +179,44 @@ function MissionActions({
   const cancel = useAtomCommand(goagent.cancelMission, { label: "GoAgent cancel" });
   const integrate = useAtomCommand(goagent.integrateMission, { label: "GoAgent integrate" });
   const verify = useAtomCommand(goagent.verifyMission, { label: "GoAgent verify" });
+  const repair = useAtomCommand(goagent.requestRepair, { label: "GoAgent repair" });
   const [busy, setBusy] = useState<string | null>(null);
-  const run = async (name: string, action: () => Promise<unknown>) => {
+  const [error, setError] = useState<string | null>(null);
+  const run = async (name: string, action: () => Promise<AtomCommandResult<unknown, unknown>>) => {
     setBusy(name);
-    await action();
+    setError(null);
+    const result = await action();
     setBusy(null);
+    // Show why a button did nothing (e.g. no default model) instead of failing silently.
+    if (!AsyncResult.isSuccess(result) && !Cause.hasInterruptsOnly(result.cause)) {
+      const cause = Cause.squash(result.cause);
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
   };
   const allDone = tasks.length > 0 && tasks.every((task) => task.state === "completed");
+  const coordinating = snapshot.coordinating === true;
+  const heldForReview = mission.state === "needs_review" && mission.baseSha === null;
+  const lastRun = snapshot.verificationRuns.at(-1);
+  const repairUsed = snapshot.events.some((event) => event.type === "repair.requested");
+  const owner = snapshot.decisions.findLast((decision) => decision.key === "failure.owner");
+  const canRepair =
+    mission.state === "needs_review" &&
+    mission.integration.status === "completed" &&
+    (lastRun?.status === "failed" || lastRun?.status === "timed_out") &&
+    !repairUsed &&
+    owner !== undefined &&
+    owner.answer !== "unknown";
   const canCancel = !["completed", "cancelled", "failed"].includes(mission.state);
   return (
-    <div className="ml-auto flex items-center gap-2">
+    <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
+      {error === null ? null : (
+        <span className="w-full text-right text-xs text-destructive-foreground">{error}</span>
+      )}
       {busy === null ? null : <Spinner />}
-      {mission.state === "planned" ? (
+      {mission.state === "planned" || heldForReview ? (
         <Button
           size="compact"
+          variant={heldForReview ? "destructive-outline" : "default"}
           disabled={busy !== null}
           onClick={() =>
             void run("approve", () =>
@@ -141,7 +224,16 @@ function MissionActions({
             )
           }
         >
-          Approve plan v{mission.planVersion}
+          {heldForReview ? "Approve despite high risk" : `Approve plan v${mission.planVersion}`}
+        </Button>
+      ) : null}
+      {canRepair ? (
+        <Button
+          size="compact"
+          disabled={busy !== null}
+          onClick={() => void run("repair", () => repair({ environmentId, input: { missionId } }))}
+        >
+          Send repair to {owner.answer}
         </Button>
       ) : null}
       {mission.state === "approved" ? (
@@ -156,12 +248,12 @@ function MissionActions({
       {(mission.state === "running" || mission.state === "needs_review") && allDone ? (
         <Button
           size="compact"
-          disabled={busy !== null}
+          disabled={busy !== null || coordinating}
           onClick={() =>
             void run("integrate", () => integrate({ environmentId, input: { missionId } }))
           }
         >
-          Integrate
+          {coordinating ? "Coordinating…" : "Integrate"}
         </Button>
       ) : null}
       {mission.integration.status === "completed" &&

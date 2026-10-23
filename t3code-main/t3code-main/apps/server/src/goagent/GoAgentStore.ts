@@ -6,11 +6,13 @@ import {
   GoAgentGraphNode,
   GoAgentGraphScan,
   GoAgentMission,
+  GoAgentProjectDecision,
   GoAgentTask,
   GoAgentVerificationCommand,
   GoAgentVerificationRun,
   type GoAgentDecisionId,
   type GoAgentMissionId,
+  type GoAgentProjectDecisionId,
   type GoAgentScanId,
   type GoAgentScanScope,
   type ProjectId,
@@ -81,6 +83,17 @@ export class GoAgentStore extends Context.Service<
     readonly getDecision: (decisionId: GoAgentDecisionId) => Fail<Option.Option<GoAgentDecision>>;
     readonly listDecisions: (missionId: GoAgentMissionId) => Fail<ReadonlyArray<GoAgentDecision>>;
 
+    readonly putProjectDecision: (decision: GoAgentProjectDecision) => Fail<void>;
+    /** Active (not retired) decisions, oldest first. */
+    readonly listProjectDecisions: (
+      projectId: ProjectId,
+    ) => Fail<ReadonlyArray<GoAgentProjectDecision>>;
+    readonly retireProjectDecision: (input: {
+      readonly projectId: ProjectId;
+      readonly decisionId: GoAgentProjectDecisionId;
+      readonly retiredAt: string;
+    }) => Fail<boolean>;
+
     readonly putVerificationRun: (run: GoAgentVerificationRun) => Fail<void>;
     readonly listVerificationRuns: (
       missionId: GoAgentMissionId,
@@ -105,6 +118,7 @@ const MissionJson = json(GoAgentMission);
 const TaskJson = json(GoAgentTask);
 const ContractJson = json(GoAgentContract);
 const DecisionJson = json(GoAgentDecision);
+const ProjectDecisionJson = json(GoAgentProjectDecision);
 const RunJson = json(GoAgentVerificationRun);
 const EventJson = json(GoAgentEvent);
 
@@ -486,6 +500,38 @@ const make = Effect.gen(function* () {
       `.pipe(
         Effect.flatMap((rows) => decodeAll(rows, DecisionJson.decode)),
         fail("listDecisions"),
+      ),
+
+    putProjectDecision: (decision) =>
+      ProjectDecisionJson.encode(decision).pipe(
+        Effect.flatMap(
+          (doc) => sql`
+            INSERT INTO goagent_project_decisions (decision_id, project_id, decision_json, created_at)
+            VALUES (${decision.decisionId}, ${decision.projectId}, ${doc}, ${decision.createdAt})
+            ON CONFLICT (decision_id) DO UPDATE SET decision_json = excluded.decision_json
+          `,
+        ),
+        Effect.asVoid,
+        fail("putProjectDecision"),
+      ),
+
+    listProjectDecisions: (projectId) =>
+      sql<{ readonly doc: string }>`
+        SELECT decision_json AS doc FROM goagent_project_decisions
+        WHERE project_id = ${projectId} AND retired_at IS NULL ORDER BY created_at, rowid
+      `.pipe(
+        Effect.flatMap((rows) => decodeAll(rows, ProjectDecisionJson.decode)),
+        fail("listProjectDecisions"),
+      ),
+
+    retireProjectDecision: ({ projectId, decisionId, retiredAt }) =>
+      sql<{ readonly decision_id: string }>`
+        UPDATE goagent_project_decisions SET retired_at = ${retiredAt}
+        WHERE decision_id = ${decisionId} AND project_id = ${projectId} AND retired_at IS NULL
+        RETURNING decision_id
+      `.pipe(
+        Effect.map((rows) => rows.length > 0),
+        fail("retireProjectDecision"),
       ),
 
     putVerificationRun: (run) =>

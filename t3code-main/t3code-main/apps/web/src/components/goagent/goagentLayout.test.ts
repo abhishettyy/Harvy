@@ -5,7 +5,15 @@ import type {
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { buildFileGraph, buildMissionDag } from "./goagentLayout";
+import {
+  agentActivity,
+  buildFileGraph,
+  buildMissionDag,
+  focusOf,
+  graphAreaOf,
+  matchesQuery,
+  nextStep,
+} from "./goagentLayout";
 
 const node = (
   id: string,
@@ -61,6 +69,25 @@ describe("buildFileGraph", () => {
     expect(graph.edges.map((e) => [e.id, e.count, e.evidence])).toEqual([
       ["app->profile:imports", 1, "verified_static"],
       ["app->profile:calls", 2, "inferred"],
+    ]);
+  });
+
+  it("shows project decisions as their own nodes with governs edges", () => {
+    const decision: GoAgentGraphNode = {
+      id: "decision:d1",
+      label: "Use the existing JWT auth",
+      kind: "decision",
+      sourceFile: "DECISIONS.md",
+      sourceLocation: null,
+      community: null,
+    };
+    const graph = buildFileGraph(
+      [...nodes, decision],
+      [edge("decision:d1", "app", "governs", "explicit_human")],
+    );
+    expect(graph.nodes.some((n) => n.id === "decision:d1")).toBe(true);
+    expect(graph.edges.map((e) => [e.id, e.evidence])).toEqual([
+      ["decision:d1->app:governs", "explicit_human"],
     ]);
   });
 
@@ -159,5 +186,154 @@ describe("buildMissionDag", () => {
     expect(dag.edges.map((e) => e.id)).toContain("contract-task:frontend");
     expect(byId.get("contract")!.x).toBeGreaterThan(byId.get("task:backend")!.x);
     expect(byId.get("task:frontend")!.x).toBeGreaterThan(byId.get("contract")!.x);
+  });
+});
+
+describe("agentActivity", () => {
+  it("gives each agent its own decisions, coordination, handoffs and graph coupling", () => {
+    const event = (type: string, actor: string, summary: string, payload: object) => ({
+      eventId: `${type}-${actor}-${summary}`,
+      missionId: "m",
+      sequence: 1,
+      type,
+      actor,
+      causedBy: null,
+      summary,
+      payload,
+      occurredAt: "",
+    });
+    const snapshot = {
+      mission: {
+        plan: { coupling: [{ from: "tests", to: "backend", edgeCount: 3, examples: [] }] },
+      },
+      tasks: [
+        { key: "backend", title: "Server", role: "backend", state: "completed", threadId: "t1" },
+        { key: "tests", title: "Tests", role: "tests", state: "running", threadId: "t2" },
+      ],
+      decisions: [
+        {
+          decisionId: "d1",
+          key: "handoff.notify",
+          answer: "notify",
+          taskKey: "backend",
+          targetTaskKey: "tests",
+        },
+      ],
+      events: [
+        event("agent.decision", "task:backend", "x", {
+          decision: "Validate displayName on the server",
+          reason: "Clients cannot be trusted",
+        }),
+        event("handoff.sent", "goagent", "Switched to tests", { from: "backend", to: "tests" }),
+        event("graph.queried", "task:tests", "tests searched the graph", {}),
+      ],
+    } as unknown as GoAgentMissionSnapshot;
+    const [backend, tests] = agentActivity(snapshot);
+    expect(backend!.recorded.map((r) => r.decision)).toEqual([
+      "Validate displayName on the server",
+    ]);
+    expect(backend!.handoffsOut.map((h) => [h.to, h.summary])).toEqual([
+      ["tests", "Switched to tests"],
+    ]);
+    expect(backend!.coupling).toEqual(["used by tests (3 graph links)"]);
+    expect(tests!.coordination.map((d) => d.decisionId)).toEqual(["d1"]);
+    expect(tests!.handoffsIn.map((h) => [h.from, h.summary])).toEqual([
+      ["backend", "Switched to tests"],
+    ]);
+    expect(tests!.graphLookups.map((l) => l.summary)).toEqual(["tests searched the graph"]);
+    expect(tests!.recorded).toEqual([]);
+  });
+});
+
+describe("knowledge graph lanes", () => {
+  it("assigns each file to the part of the app it belongs to", () => {
+    expect(graphAreaOf({ kind: "file", sourceFile: "server/routes/profile.ts" })).toBe("server");
+    expect(graphAreaOf({ kind: "file", sourceFile: "web/src/api/profile.ts" })).toBe("client");
+    expect(graphAreaOf({ kind: "file", sourceFile: "tests/server/profile.test.ts" })).toBe("tests");
+    expect(graphAreaOf({ kind: "file", sourceFile: "vitest.config.ts" })).toBe("other");
+    expect(graphAreaOf({ kind: "decision", sourceFile: "DECISIONS.md" })).toBe("decision");
+  });
+
+  it("lays files out in one lane per area, left to right, without overlap", () => {
+    const graph = buildFileGraph(
+      [
+        node("web", "file", "web/src/App.tsx"),
+        node("srv", "file", "server/app.ts"),
+        node("tst", "file", "tests/server/app.test.ts"),
+      ],
+      [],
+    );
+    expect(graph.lanes.map((lane) => [lane.area, lane.count])).toEqual([
+      ["server", 1],
+      ["tests", 1],
+      ["client", 1],
+    ]);
+    const x = (id: string) => graph.nodes.find((n) => n.id === id)!.x;
+    expect(x("srv")).toBeLessThan(x("tst"));
+    expect(x("tst")).toBeLessThan(x("web"));
+    for (const [a, b] of [
+      [graph.lanes[0]!, graph.lanes[1]!],
+      [graph.lanes[1]!, graph.lanes[2]!],
+    ] as const)
+      expect(a.x + a.width).toBeLessThan(b.x);
+  });
+
+  it("focuses a file on its direct links and finds files by name or path", () => {
+    const edges = [
+      { id: "a->b", source: "a", target: "b" },
+      { id: "c->a", source: "c", target: "a" },
+      { id: "c->d", source: "c", target: "d" },
+    ];
+    const focus = focusOf(edges, "a");
+    expect([...focus.nodeIds].toSorted()).toEqual(["a", "b", "c"]);
+    expect([...focus.edgeIds].toSorted()).toEqual(["a->b", "c->a"]);
+    expect(
+      matchesQuery({ label: "profile.ts", sourceFile: "server/routes/profile.ts" }, "ROUTES"),
+    ).toBe(true);
+    expect(matchesQuery({ label: "app.ts", sourceFile: "server/app.ts" }, "  ")).toBe(false);
+  });
+});
+
+describe("nextStep", () => {
+  const base = {
+    mission: {
+      state: "needs_review",
+      baseSha: null,
+      plan: { tasks: [{ key: "backend" }, { key: "frontend" }, { key: "tests" }] },
+      integration: { status: "not_started", conflictFiles: [] },
+      failureReason: "Rated high risk by Jev; approve again to start.",
+    },
+    tasks: [],
+    decisions: [{ key: "mission.risk", answer: "high", confidence: 1 }],
+    verificationRuns: [],
+    events: [],
+  };
+
+  it("tells the user to approve a plan held for high risk", () => {
+    const step = nextStep(base as unknown as GoAgentMissionSnapshot);
+    expect(step.tone).toBe("action");
+    expect(step.title).toContain("Approve despite high risk");
+    expect(step.detail).toContain("high risk (100%)");
+  });
+
+  it("tells the user to start an approved mission", () => {
+    const step = nextStep({
+      ...base,
+      mission: { ...base.mission, state: "approved" },
+    } as unknown as GoAgentMissionSnapshot);
+    expect(step.title).toBe("Click Start agents");
+    expect(step.detail).toContain("3 agents");
+  });
+
+  it("asks for a default model before starting when the project has none", () => {
+    const step = nextStep(
+      {
+        ...base,
+        mission: { ...base.mission, state: "approved" },
+      } as unknown as GoAgentMissionSnapshot,
+      { agentModelMissing: true },
+    );
+    expect(step.tone).toBe("problem");
+    expect(step.title).toBe("Set a default model before starting");
   });
 });

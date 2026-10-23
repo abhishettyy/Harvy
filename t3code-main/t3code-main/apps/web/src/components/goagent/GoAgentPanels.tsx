@@ -79,12 +79,18 @@ function DecisionCard({
       <div className="flex items-center gap-2">
         <span className="text-xs text-muted-foreground">Answer</span>
         <StateBadge state={decision.answer} />
-        {decision.confidence === null ? null : (
+        {decision.confidence === null || decision.source !== "jev" ? null : (
           <span className="text-xs">confidence {percent(decision.confidence)}</span>
         )}
       </div>
       {probabilities.length > 0 ? (
         <div className="flex flex-col gap-1">
+          {decision.source === "jev" ? null : (
+            <span className="text-xs text-muted-foreground">
+              Jev{decision.model === null ? "" : ` (${decision.model})`} said, not used
+              {decision.confidence === null ? "" : ` · confidence ${percent(decision.confidence)}`}
+            </span>
+          )}
           {probabilities.map(([label, value]) => (
             <div key={label} className="flex items-center gap-2 text-xs">
               <span className="w-28 truncate">{label}</span>
