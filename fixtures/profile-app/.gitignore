@@ -1,0 +1,7 @@
+node_modules
+*.sqlite
+.goagent-test-results.json
+dist
+.env
+.env.*
+!.env.example

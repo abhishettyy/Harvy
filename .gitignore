@@ -147,3 +147,27 @@ vite.config.ts.timestamp-*
 
 # Turbo Repo
 .turbo
+
+# --- GoAgent ---
+# Local T3 Code dev home (databases, logs, secrets, worktrees)
+.t3-dev/
+.t3/
+# Third-party reference clones inside the T3 fork; not part of GoAgent
+t3code-main/t3code-main/.repos/
+# Graphify output and caches
+graphify-out/
+.graphify/
+# Local databases and test reports
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+.goagent-test-results.json
+# Python
+__pycache__/
+*.pyc
+.venv/
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea/
